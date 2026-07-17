@@ -1,0 +1,17 @@
+# Continuum SLM - Core Dependencies
+torch>=2.0.0
+numpy>=1.24.0
+tqdm>=4.65.0
+
+# Tokenizer
+regex>=2023.0.0
+
+# UI Backend
+flask>=2.3.0
+flask-cors>=4.0.0
+
+# Training data / utilities
+datasets>=2.14.0
+
+# Quantization (optional, for inference)
+# bitsandbytes>=0.41.0  # Uncomment if CUDA available

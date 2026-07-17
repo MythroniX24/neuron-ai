@@ -1,0 +1,230 @@
+"""
+Parallel Associative Scan for GLT Training (Section 6, 18).
+
+The GLT recurrence:
+    S_t = diag(gamma_t) * S_{t-1} + diag(iota_t) * B_t
+
+is a first-order linear recurrence: S_t = a_t ⊙ S_{t-1} + b_t
+where ⊙ is row-wise scaling and + is matrix addition.
+
+The combine operator for two adjacent steps is:
+    (a2, b2) ∘ (a1, b1) = (a2 ⊙ a1, a2 ⊙ b1 + b2)
+
+This is associative, enabling O(log n) parallel prefix scan.
+
+FIX: Double-buffering — clone a/b at each while-loop iteration.
+Read from original, inplace-write to clone. This prevents autograd
+version mismatch because clone tensors are fresh (no saved context).
+"""
+
+import torch
+import torch.nn.functional as F
+from typing import Tuple
+
+
+def associative_scan(
+    gammas: torch.Tensor,
+    inputs: torch.Tensor,
+    reverse: bool = False,
+) -> torch.Tensor:
+    """
+    Parallel prefix scan for GLT state evolution.
+    
+    Uses DOUBLE-BUFFERING: each while-loop iteration clones a/b,
+    reads from original, inplace-writes to clone. This prevents
+    autograd version corruption from slice assignments.
+
+    Args:
+        gammas: Decay gate vectors [B, L, d_state]
+        inputs: Gated outer products [B, L, d_state, d_state]
+        reverse: If True, scan from right to left
+
+    Returns:
+        states: All intermediate states [B, L, d_state, d_state]
+    """
+    B, L, D, _ = inputs.shape
+
+    if reverse:
+        gammas = torch.flip(gammas, dims=[1])
+        inputs = torch.flip(inputs, dims=[1])
+
+    L2 = L
+
+    a = gammas                     # [B, L, D]
+    b = inputs                     # [B, L, D, D]
+
+    # ================================================================
+    # KOGGE-STONE PARALLEL PREFIX SCAN
+    #
+    # At each step s = 2^k, element i combines with element i-s.
+    # After log2(L) steps, element i has prefix of elements 0..i.
+    # Uses double-buffering to avoid inplace autograd corruption.
+    # ================================================================
+    # ================================================================
+    # VECTORIZED KOGGE-STONE
+    #
+    # Instead of a Python for-loop over i in range(step, L),
+    # we batch ALL i positions in a single tensor operation:
+    #   a_next[step:]  = a[step:]  * a[:-step]      # [B, L-step, D]
+    #   b_next[step:]  = a[step:,None,:] * b[:-step] + b[step:]  # [B, L-step, D, D]
+    #
+    # This replaces ~L/2 Python loop iterations per step
+    # with 2 batched CUDA kernel calls. ~50x less Python overhead!
+    # ================================================================
+    step = 1
+    while step < L:
+        a_next = a.clone()
+        b_next = b.clone()
+
+        # Vectorized: all (i, i-step) pairs in one shot
+        a_r = a[:, step:, :]                         # [B, L-step, D]
+        b_r = b[:, step:, :, :]                      # [B, L-step, D, D]
+        a_l = a[:, :-step, :]                        # [B, L-step, D]
+        b_l = b[:, :-step, :, :]                     # [B, L-step, D, D]
+
+        # a_new = a_r * a_l  (element-wise)
+        a_next[:, step:, :] = a_r * a_l
+
+        # b_new = a_r.unsqueeze(3) * b_l + b_r
+        # a_r: [B, L-step, D] → unsqueeze(3) → [B, L-step, D, 1]
+        # broadcasts with b_l: [B, L-step, D, D] → scales each d-row of b
+        b_next[:, step:, :, :] = a_r.unsqueeze(3) * b_l + b_r
+
+        # ⚡ FP16 SAFETY: Catch NaN/Inf at EACH log2 step, not just at the end
+        # Without this, FP16 overflow at step 1 cascades through all subsequent steps
+        a_next = torch.nan_to_num(a_next, nan=0.0, posinf=1e4, neginf=-1e4)
+        b_next = torch.nan_to_num(b_next, nan=0.0, posinf=1e4, neginf=-1e4)
+
+        a = a_next
+        b = b_next
+        step *= 2
+
+    # Trim padding
+    states = b[:, :L, :, :]
+
+    if reverse:
+        states = torch.flip(states, dims=[1])
+
+    return states
+
+
+def glt_parallel_forward(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q: torch.Tensor,
+    gamma: torch.Tensor,
+    iota: torch.Tensor,
+    r: torch.Tensor,
+    W_o_weight: torch.Tensor,
+) -> torch.Tensor:
+    """Full parallel GLT forward pass for training."""
+    B, L, D = k.shape
+
+    # ⚡ FP16 SAFETY: Clamp k/v to prevent overflow in outer product
+    # FP16 max is 65504; outer product of two 256-value vectors = 65536
+    # With AMP FP16, k/v can occasionally produce values > 256
+    # Clamping to [-16, 16] keeps outer product in safe FP16 range
+    k_safe = k.clamp(min=-16.0, max=16.0)
+    v_safe = v.clamp(min=-16.0, max=16.0)
+
+    # ⚡ Optimized: k.unsqueeze(-1) * v.unsqueeze(-2) is 2-3x faster than einsum
+    #   k: [B, L, D] → unsqueeze(-1) → [B, L, D, 1]
+    #   v: [B, L, D] → unsqueeze(-2) → [B, L, 1, D]
+    #   matmul: [B, L, D, 1] @ [B, L, 1, D] = [B, L, D, D]
+    outer = k_safe.unsqueeze(-1) @ v_safe.unsqueeze(-2)
+    gated_input = iota.unsqueeze(-1) * outer
+    states = associative_scan(gamma, gated_input)
+
+    # ⚡ FP16 SAFETY: Replace any NaN/Inf from FP16 overflow with 0
+    # Accumulation in associative scan can overflow FP16 range
+    states = torch.nan_to_num(states, nan=0.0, posinf=1e4, neginf=-1e4)
+
+    # ⚡ Optimized: h = sum_{e} S[..., e] * q[..., e] = matmul with q as last dim
+    #   states @ q.unsqueeze(-1) → [B, L, D, D] @ [B, L, D, 1] = [B, L, D, 1]
+    h = (states @ q.unsqueeze(-1)).squeeze(-1)  # [B, L, D]
+    o = r * h
+    # ⚡ Optimized: matmul instead of einsum
+    #   o: [B, L, D], W_o: [D, d_model] → [B, L, d_model]
+    o = o @ W_o_weight.T
+
+    return o
+
+
+def glt_parallel_forward_with_state(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q: torch.Tensor,
+    gamma: torch.Tensor,
+    iota: torch.Tensor,
+    r: torch.Tensor,
+    W_o_weight: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Parallel GLT forward that ALSO returns the final state.
+
+    Returns:
+        outputs: [B, L, d_model]
+        final_state: [B, d_state, d_state]
+    """
+    B, L, D = k.shape
+
+    # ⚡ FP16 SAFETY: Clamp k/v to prevent overflow in outer product
+    k_safe = k.clamp(min=-16.0, max=16.0)
+    v_safe = v.clamp(min=-16.0, max=16.0)
+
+    # ⚡ Optimized: unsqueeze matmul instead of einsum
+    outer = k_safe.unsqueeze(-1) @ v_safe.unsqueeze(-2)
+    gated_input = iota.unsqueeze(-1) * outer
+    states = associative_scan(gamma, gated_input)
+
+    # ⚡ Final FP16 safety (belt-and-suspenders after per-step nan_to_num in scan)
+    # This catches any remaining edge case
+    states = torch.nan_to_num(states, nan=0.0, posinf=1e4, neginf=-1e4)
+
+    # ⚡ Optimized: matmul instead of einsum
+    h = (states @ q.unsqueeze(-1)).squeeze(-1)
+    o = r * h
+    o = o @ W_o_weight.T
+
+    final_state = states[:, -1, :, :]  # [B, D, D]
+
+    return o, final_state
+
+
+def glt_sequential_forward(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q: torch.Tensor,
+    gamma: torch.Tensor,
+    iota: torch.Tensor,
+    r: torch.Tensor,
+    W_o_weight: torch.Tensor,
+) -> torch.Tensor:
+    """Sequential GLT forward pass (for validation/testing)."""
+    B, L, D = k.shape
+    d_model = W_o_weight.shape[0]
+    device = k.device
+
+    state = torch.zeros(B, D, D, device=device, dtype=k.dtype)
+    outputs = []
+
+    for t in range(L):
+        # outer: k_t @ v_t^T  [B, D, D]
+        k_t = k[:, t, :].unsqueeze(2)    # [B, D, 1]
+        v_t = v[:, t, :].unsqueeze(1)    # [B, 1, D]
+        outer_t = torch.bmm(k_t, v_t)    # [B, D, D]
+
+        # S_t = gamma_t * S_{t-1} + iota_t * outer_t
+        gamma_t = gamma[:, t, :].unsqueeze(2)    # [B, D, 1]
+        iota_t = iota[:, t, :].unsqueeze(2)      # [B, D, 1]
+        state = gamma_t * state + iota_t * outer_t
+
+        # h_t = S_t @ q_t
+        q_t = q[:, t, :].unsqueeze(2)   # [B, D, 1]
+        h_t = torch.bmm(state, q_t).squeeze(2)   # [B, D]
+
+        o_t = r[:, t] * h_t
+        o_t = F.linear(o_t, W_o_weight)
+        outputs.append(o_t.unsqueeze(1))
+
+    return torch.cat(outputs, dim=1)
