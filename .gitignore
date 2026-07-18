@@ -1,50 +1,63 @@
+# ──────────────────────────────────────────────
+# PYTHON
+# ──────────────────────────────────────────────
+__pycache__/
+continuum/**/__pycache__/
+*.py[cod]
+*$py.class
+*.egg
+*.egg-info/
+build/
+dist/
+env/
+venv/
+.venv/
+.conda/
 
+# ──────────────────────────────────────────────
+# NOTEBOOKS & DATA
+# ──────────────────────────────────────────────
+*.ipynb
+*.json
+*.log
+
+# ──────────────────────────────────────────────
+# MODEL FILES & CHECKPOINTS
+# ──────────────────────────────────────────────
+*.pt
+*.pth
+*.onnx
+*.bin
+checkpoints/*
+
+# ──────────────────────────────────────────────
+# ARCHIVES
+# ──────────────────────────────────────────────
+*.zip
+
+# ──────────────────────────────────────────────
+# IDE / OS
+# ──────────────────────────────────────────────
+.idea/
+.vscode/
+.ipynb_checkpoints/
+.DS_Store
+Thumbs.db
+*~
+*.swp
+*.swo
+
+# ──────────────────────────────────────────────
+# GIT REWRITE ARTIFACTS
+# ──────────────────────────────────────────────
+.git-rewrite/
+.git-rewrite
+
+# ──────────────────────────────────────────────
+# ⚡ EXCEPTIONS — Must be AFTER the patterns above
+# ──────────────────────────────────────────────
 !.gitignore
 !checkpoints/.gitkeep
 !continuum/colab/*.ipynb
 !continuum/kaggle/*.ipynb
 !continuum/tokenizer/*.json
-# Data
-# IDE
-# Jupyter / Colab
-# Keep gitignore
-# Logs
-# OS
-# Project specific
-# PyTorch / Model
-# Python
-# Virtual environments
-*$py.class
-*.bin
-*.egg
-*.egg-info/
-*.ipynb
-*.json
-*.log
-*.onnx
-*.pt
-*.pth
-*.py[cod]
-*.so
-*.swo
-*.swp
-*.zip
-*~
-.DS_Store
-.conda/
-.idea/
-.ipynb_checkpoints/
-.venv/
-.vscode/
-Thumbs.db
-__pycache__/
-build/
-checkpoints/
-continuum/**/__pycache__/
-data/
-dist/
-env/
-logs/
-venv/
-.git-rewrite/
-.git-rewrite
