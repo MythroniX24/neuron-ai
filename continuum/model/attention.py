@@ -97,10 +97,20 @@ class AnchorAttention(nn.Module):
         self._cached_static_v = None
 
     def _get_kv_weights(self):
-        """Extract K and V weight matrices from fused W_qkv."""
+        """Extract K and V weight matrices from fused W_qkv.
+        
+        Handles both regular nn.Linear and QuantizedLinear layers.
+        For QuantizedLinear, dequantizes INT8 weights back to float on-the-fly.
+        """
+        if hasattr(self.W_qkv, 'weight'):
+            # Regular nn.Linear
+            weight = self.W_qkv.weight
+        else:
+            # QuantizedLinear: dequantize INT8 → float on demand
+            weight = self.W_qkv.weight_int8.float() * self.W_qkv.scale.float()
         return (
-            self.W_qkv.weight[self.q_dim:self.q_dim + self.kv_dim],
-            self.W_qkv.weight[self.q_dim + self.kv_dim:self.q_dim + 2 * self.kv_dim],
+            weight[self.q_dim:self.q_dim + self.kv_dim],
+            weight[self.q_dim + self.kv_dim:self.q_dim + 2 * self.kv_dim],
         )
 
     def refresh_static_cache(self):

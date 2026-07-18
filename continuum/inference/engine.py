@@ -162,6 +162,7 @@ class ContinuumInference:
         )
         self.conversation_tokens = state_dict.get("conversation_tokens", [])
 
+    @torch.no_grad()
     def _generate_text(
         self,
         prompt: str,
@@ -199,6 +200,9 @@ class ContinuumInference:
         generated_tokens = []
         for i in range(max_new_tokens):
             logits = next_logits.clone()
+            
+            # 🛡️ Sanitize logits before any processing
+            logits = torch.nan_to_num(logits, nan=0.0, posinf=5e4, neginf=-5e4)
             logits = logits / max(temperature, 0.01)
 
             if repetition_penalty > 1.0 and generated_tokens:
@@ -220,7 +224,17 @@ class ContinuumInference:
                 indices_to_remove = remove.scatter(1, sorted_idx, remove)
                 logits[indices_to_remove] = float("-inf")
 
+            # 🛡️ Sanitize logits after filtering
+            logits = torch.nan_to_num(logits, nan=-1e9, posinf=1e9, neginf=-1e9)
+
             probs = torch.softmax(logits, dim=-1)
+            # 🛡️ Sanitize probs: replace NaN with 0, handle all-zero case
+            probs = torch.nan_to_num(probs, nan=0.0)
+            if probs.sum() < 1e-8:
+                # Fallback: uniform distribution over vocab
+                probs = torch.ones_like(probs) / probs.shape[-1]
+            probs = probs / probs.sum(dim=-1, keepdim=True)  # Re-normalize
+
             next_token = torch.multinomial(probs, 1)
 
             token_id = next_token[0, 0].item()
@@ -276,6 +290,9 @@ class ContinuumInference:
         generated_tokens = []
         for i in range(max_new_tokens):
             logits = next_logits.clone()
+            
+            # 🛡️ Sanitize logits before any processing
+            logits = torch.nan_to_num(logits, nan=0.0, posinf=5e4, neginf=-5e4)
             logits = logits / max(temperature, 0.01)
 
             if repetition_penalty > 1.0 and generated_tokens:
@@ -297,7 +314,17 @@ class ContinuumInference:
                 indices_to_remove = remove.scatter(1, sorted_idx, remove)
                 logits[indices_to_remove] = float("-inf")
 
+            # 🛡️ Sanitize logits after filtering
+            logits = torch.nan_to_num(logits, nan=-1e9, posinf=1e9, neginf=-1e9)
+
             probs = torch.softmax(logits, dim=-1)
+            # 🛡️ Sanitize probs: replace NaN with 0, handle all-zero case
+            probs = torch.nan_to_num(probs, nan=0.0)
+            if probs.sum() < 1e-8:
+                # Fallback: uniform distribution over vocab
+                probs = torch.ones_like(probs) / probs.shape[-1]
+            probs = probs / probs.sum(dim=-1, keepdim=True)  # Re-normalize
+
             next_token = torch.multinomial(probs, 1)
 
             token_id = next_token[0, 0].item()
