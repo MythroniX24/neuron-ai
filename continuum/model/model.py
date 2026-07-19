@@ -434,7 +434,8 @@ class ContinuumModel(nn.Module):
         if n_loops > 1:
             probs = torch.stack(halting_probs, dim=0)
             cumulative = probs.cumsum(dim=0)
-            remainder = 1.0 - cumulative[:-1].sum(dim=0).clamp(min=0)
+            # Correct ACT remainder: last prob absorbs remaining probability mass
+            remainder = 1.0 - cumulative[-2].clamp(min=0, max=1.0)
             probs_normalized = probs.clone()
             probs_normalized[-1] = remainder
 
@@ -588,10 +589,11 @@ class ContinuumModel(nn.Module):
                 last_x = block.mixer.norm(x[:, -ws:, :])  # [B, min(L, ws), d_model]
                 actual_ws = last_x.shape[1]
                 # ⚡ Fused K/V: single matmul for both K and V projections
-                # Uses W_qkv weight (already fused QKV) and extracts K,V slices
-                # 2 separate matmuls → 1 fused matmul = -50% kernel launch overhead
-                qkv_all = F.linear(last_x, block.mixer.W_qkv.weight)  # [B, actual_ws, q_dim+2*kv_dim]
-                _, new_wk_flat, new_wv_flat = qkv_all.split(
+                # Uses _get_kv_weights() to support quantized weights (INT8/INT4)
+                # 1 fused matmul instead of 2 separate = -50% kernel launch overhead
+                W_k_w, W_v_w = block.mixer._get_kv_weights()
+                kv_all = F.linear(last_x, torch.cat([W_k_w, W_v_w], dim=0))  # [B, actual_ws, 2*kv_dim]
+                new_wk_flat, new_wv_flat = kv_all.split(
                     [block.mixer.q_dim, block.mixer.kv_dim, block.mixer.kv_dim], dim=-1
                 )
                 

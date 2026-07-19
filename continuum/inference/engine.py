@@ -688,10 +688,14 @@ class ContinuumInference:
 
     def _apply_quantization(self):
         """Apply INT8 quantization to all linear layers (with cached weights)."""
+        from continuum.model.attention import AnchorAttention
         def _quantize_module(module):
             for name, child in module.named_children():
                 if isinstance(child, nn.Linear) and child.in_features > 64:
                     setattr(module, name, QuantizedLinear(child))
+                    # Update format flag so AnchorAttention._get_kv_weights() routes correctly
+                    if isinstance(module, AnchorAttention) and name == "W_qkv":
+                        module._w_qkv_format = "int8"
                 else:
                     _quantize_module(child)
         _quantize_module(self.model)
@@ -705,12 +709,13 @@ class ContinuumInference:
     def _estimate_model_size(self) -> float:
         """Estimate model size in MB."""
         total_bytes = 0
-        for p in self.model.parameters():
-            if hasattr(p, 'weight_int8'):
-                total_bytes += p.weight_int8.numel()  # INT8
-                total_bytes += p.scale.numel() * 4     # scale
+        for module in self.model.modules():
+            if isinstance(module, QuantizedLinear):
+                total_bytes += module.weight_int8.numel()  # INT8
+                total_bytes += module.scale.numel() * 4     # scale
             else:
-                total_bytes += p.numel() * 4
+                for p in module.parameters(recurse=False):
+                    total_bytes += p.numel() * 4
         return total_bytes / (1024 * 1024)
 
     def start_conversation(self) -> str:

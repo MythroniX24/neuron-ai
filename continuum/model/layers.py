@@ -184,10 +184,8 @@ class GLTLayer(nn.Module):
         # Output gate + projection
         o = self.W_o(r * h)  # [B, d_model]
 
-        # Residual connection
-        o = o + residual
-
-        o = self.dropout(o)
+        # Residual connection (dropout BEFORE adding residual)
+        o = residual + self.dropout(o)
 
         return o, state
 
@@ -360,9 +358,11 @@ class GatedShardFFN(nn.Module):
         Usage:
             ffn = GatedShardFFN.get_compiled_ffn(d_model=768, expansion=4, num_shards=6)
         """
-        ffn = GatedShardFFN(d_model, expansion, num_shards, dropout)
-        ffn.forward = torch.compile(ffn.forward, mode="default", fullgraph=False)
-        return ffn
+        return torch.compile(
+            GatedShardFFN(d_model, expansion, num_shards, dropout),
+            mode="default",
+            fullgraph=False,
+        )
 
 
 # ============================================================================

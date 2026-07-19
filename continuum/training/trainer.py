@@ -178,6 +178,9 @@ class ContinuumTrainer:
         self.model.train()
         self.global_step += 1
 
+        # ⚡ Phase 5: Determine optimizer step boundary first (used by LR warmup and logging)
+        is_optimizer_step = accumulation_step == total_accumulation_steps
+
         # ⚡ Phase 5: Only warmup LR on optimizer step boundaries (not every accumulation micro-step)
         if is_optimizer_step:
             self._warmup_lr(self.global_step)
@@ -189,10 +192,6 @@ class ContinuumTrainer:
         # Zero gradients at START of accumulation
         if accumulation_step == 1:
             self.optimizer.zero_grad(set_to_none=True)  # Faster than zero_grad()
-
-        # ⚡ Phase 5: Skip warmup on non-optimizer-step calls (accumulation steps 2-4)
-        # Only do warmup when the optimizer actually steps
-        is_optimizer_step = accumulation_step == total_accumulation_steps
 
         # ⚡ AMP: Forward pass in FP16 (Tensor Cores enabled)
         # ⚡ core_max_loops=1: Single-pass Core during training (ADL disabled)

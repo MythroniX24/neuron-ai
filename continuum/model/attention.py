@@ -77,6 +77,9 @@ class AnchorAttention(nn.Module):
             torch.randn(n_static_anchors, d_model) * 0.02
         )
 
+        # Track W_qkv format to avoid hasattr checks in hot path (graph-break friendly)
+        self._w_qkv_format = "linear"
+
         # ALiBi slopes: one per head (for window portion only)
         self._init_alibi_slopes()
 
@@ -101,18 +104,25 @@ class AnchorAttention(nn.Module):
         
         Handles regular nn.Linear, QuantizedLinear (INT8), and QuantizedLinearINT4.
         For quantized layers, dequantizes weights back to float on-the-fly.
+        Uses a cached format flag to avoid hasattr checks in the hot path.
         """
-        if hasattr(self.W_qkv, 'weight'):
-            # Regular nn.Linear
-            weight = self.W_qkv.weight
-        elif hasattr(self.W_qkv, 'weight_int8'):
-            # QuantizedLinear (INT8): dequantize INT8 → float on demand
+        fmt = getattr(self, "_w_qkv_format", "linear")
+        if fmt == "int8":
             weight = self.W_qkv.weight_int8.float() * self.W_qkv.scale.float()
-        elif hasattr(self.W_qkv, '_dequantize'):
-            # Any quantized linear (INT4/INT8): dequantize via _dequantize()
+        elif fmt in ("int4", "quantized"):
             weight = self.W_qkv._dequantize()
         else:
-            raise AttributeError(f"W_qkv has no recognized weight format: {type(self.W_qkv)}")
+            # Default: regular nn.Linear. If a quantizer forgot to update the flag,
+            # fall back gracefully to the first available weight representation.
+            try:
+                weight = self.W_qkv.weight
+            except AttributeError:
+                if hasattr(self.W_qkv, "weight_int8"):
+                    weight = self.W_qkv.weight_int8.float() * self.W_qkv.scale.float()
+                elif hasattr(self.W_qkv, "_dequantize"):
+                    weight = self.W_qkv._dequantize()
+                else:
+                    raise AttributeError(f"W_qkv has no recognized weight format: {type(self.W_qkv)}")
         return (
             weight[self.q_dim:self.q_dim + self.kv_dim],
             weight[self.q_dim + self.kv_dim:self.q_dim + 2 * self.kv_dim],

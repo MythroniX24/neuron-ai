@@ -123,6 +123,7 @@ class QuantizedLinearINT4(nn.Module):
 
 def _apply_int4_to_model(model) -> int:
     """Replace all Linear layers with QuantizedLinearINT4. Returns count."""
+    from continuum.model.attention import AnchorAttention
     count = 0
 
     def _replace(module):
@@ -131,6 +132,9 @@ def _apply_int4_to_model(model) -> int:
             if isinstance(child, nn.Linear) and child.in_features > 64:
                 setattr(module, name, QuantizedLinearINT4(child, bits=4))
                 count += 1
+                # Update format flag so AnchorAttention._get_kv_weights() routes correctly
+                if isinstance(module, AnchorAttention) and name == "W_qkv":
+                    module._w_qkv_format = "int4"
             else:
                 _replace(child)
 
