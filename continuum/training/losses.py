@@ -45,8 +45,12 @@ class ContinuumLoss(nn.Module):
         self.memory_weight = memory_weight
 
         # Base cross-entropy
-        self.ce_loss = nn.CrossEntropyLoss(ignore_index=-100)  # -100 = PyTorch standard for ignored tokens
+        self.ce_loss = nn.CrossEntropyLoss(ignore_index=-100)
         self._pad_token_id = pad_token_id
+
+        # ⚡ Phase 5: Pre-allocated zero tensors (avoid GPU sync on every step)
+        self._zero = None
+        self._device_hint = None
 
     def forward(
         self,
@@ -84,14 +88,14 @@ class ContinuumLoss(nn.Module):
 
         # 3. Gated Shard FFN sparsity regularizer
         # Push gate values toward 0 or 1: minimize g*(1-g)
-        sparsity = torch.tensor(0.0, device=logits.device)
-        if ffn_gates is not None:
-            # ffn_gates: [B, L, K, n_layers] in (0, 1)
-            # Sparse loss: g * (1-g) averaged over all gates
-            sparsity = (ffn_gates * (1 - ffn_gates)).mean()
+        # ⚡ Phase 5: Reuse pre-allocated zero tensor (avoids GPU sync)
+        if self._zero is None or self._device_hint != logits.device:
+            self._zero = torch.tensor(0.0, device=logits.device)
+            self._device_hint = logits.device
+        sparsity = self._zero if ffn_gates is None else (ffn_gates * (1 - ffn_gates)).mean()
 
         # 4. Memory-only prediction auxiliary loss
-        memory = torch.tensor(0.0, device=logits.device)
+        memory = self._zero
         if memory_logits is not None and memory_targets is not None:
             memory = self.ce_loss(
                 memory_logits.reshape(B * L, V),

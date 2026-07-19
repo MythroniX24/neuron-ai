@@ -445,10 +445,10 @@ class ConversationalDataset:
         num_buckets: int = 8,
         shuffle: bool = True,
         subset_indices = None,
-        num_workers: int = 0,
-        pin_memory: bool = False,
-        prefetch_factor: int = 2,
-        persistent_workers: bool = False,
+        num_workers: int = 2,
+        pin_memory: bool = True,
+        prefetch_factor: int = 4,
+        persistent_workers: bool = True,
     ):
         """
         ⚡ Phase 1: Bucket sampler — groups same-length sequences to minimize padding waste.

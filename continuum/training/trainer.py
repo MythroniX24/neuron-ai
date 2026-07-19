@@ -178,8 +178,9 @@ class ContinuumTrainer:
         self.model.train()
         self.global_step += 1
 
-        # Warmup learning rate
-        self._warmup_lr(self.global_step)
+        # ⚡ Phase 5: Only warmup LR on optimizer step boundaries (not every accumulation micro-step)
+        if is_optimizer_step:
+            self._warmup_lr(self.global_step)
 
         # Move data to device (async for GPU)
         input_ids = batch["input_ids"][:, :seq_len_curriculum].to(self.device, non_blocking=True)
@@ -189,10 +190,12 @@ class ContinuumTrainer:
         if accumulation_step == 1:
             self.optimizer.zero_grad(set_to_none=True)  # Faster than zero_grad()
 
+        # ⚡ Phase 5: Skip warmup on non-optimizer-step calls (accumulation steps 2-4)
+        # Only do warmup when the optimizer actually steps
+        is_optimizer_step = accumulation_step == total_accumulation_steps
+
         # ⚡ AMP: Forward pass in FP16 (Tensor Cores enabled)
         # ⚡ core_max_loops=1: Single-pass Core during training (ADL disabled)
-        #     ADL is an inference-time optimization — training only needs
-        #     single-pass gradient estimation. 5x faster Core stage!
         with torch.amp.autocast("cuda", enabled=self.use_amp, dtype=torch.float16):
             if self.use_parallel_forward:
                 result = self.model.forward_parallel(input_ids, core_max_loops=1)
@@ -228,8 +231,7 @@ class ContinuumTrainer:
         self.total_tokens_processed += B * L
 
         # Only clip and step at END of accumulation
-        is_last_step = accumulation_step == total_accumulation_steps
-        if is_last_step:
+        if is_optimizer_step:
             # ⚡ AMP: Unscale gradients before clipping
             if self.scaler is not None:
                 self.scaler.unscale_(self.optimizer)
@@ -250,8 +252,8 @@ class ContinuumTrainer:
         # Anneal loss weights
         self.loss_fn.anneal_weights(self.global_step, 100000)
 
-        # ⚡ Phase 4: Only monitor gamma on log intervals (not every step — saves GPU sync)
-        gamma_monitor = self._monitor_gamma_gates() if is_last_step and self.global_step % self.log_interval == 0 else {}
+        # ⚡ Phase 5: Only monitor gamma on log intervals (not every step — saves GPU sync)
+        gamma_monitor = self._monitor_gamma_gates() if is_optimizer_step and self.global_step % self.log_interval == 0 else {}
 
         return {
             "loss": losses["total"].item(),
@@ -398,10 +400,9 @@ class ContinuumTrainer:
             else:
                 seq_len = seq_len_end
 
-            # Clear CUDA cache at epoch boundaries
+            # ⚡ Phase 5: Only GC at epoch start (not both start AND end)
             if self.device == "cuda":
                 torch.cuda.empty_cache()
-                import gc; gc.collect()
 
             pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} (L={seq_len})")
             for batch_idx, batch in enumerate(pbar):
@@ -430,9 +431,6 @@ class ContinuumTrainer:
             epoch_time = time.time() - epoch_start
 
             # Validation
-            if self.device == "cuda":
-                torch.cuda.empty_cache()
-                import gc; gc.collect()
             val_metrics = self.validate(val_loader)
             val_loss = val_metrics["val_loss"]
 
