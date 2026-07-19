@@ -99,15 +99,20 @@ class AnchorAttention(nn.Module):
     def _get_kv_weights(self):
         """Extract K and V weight matrices from fused W_qkv.
         
-        Handles both regular nn.Linear and QuantizedLinear layers.
-        For QuantizedLinear, dequantizes INT8 weights back to float on-the-fly.
+        Handles regular nn.Linear, QuantizedLinear (INT8), and QuantizedLinearINT4.
+        For quantized layers, dequantizes weights back to float on-the-fly.
         """
         if hasattr(self.W_qkv, 'weight'):
             # Regular nn.Linear
             weight = self.W_qkv.weight
-        else:
-            # QuantizedLinear: dequantize INT8 → float on demand
+        elif hasattr(self.W_qkv, 'weight_int8'):
+            # QuantizedLinear (INT8): dequantize INT8 → float on demand
             weight = self.W_qkv.weight_int8.float() * self.W_qkv.scale.float()
+        elif hasattr(self.W_qkv, '_dequantize'):
+            # Any quantized linear (INT4/INT8): dequantize via _dequantize()
+            weight = self.W_qkv._dequantize()
+        else:
+            raise AttributeError(f"W_qkv has no recognized weight format: {type(self.W_qkv)}")
         return (
             weight[self.q_dim:self.q_dim + self.kv_dim],
             weight[self.q_dim + self.kv_dim:self.q_dim + 2 * self.kv_dim],
