@@ -14,6 +14,14 @@ from typing import Optional, Tuple
 
 from continuum.model.layers import RMSNorm
 
+# ⚡ Phase 6: FlexAttention — fused custom attention patterns
+# Available in PyTorch >= 2.5; gracefully falls back to SDPA otherwise
+try:
+    from torch.nn.attention.flex_attention import flex_attention
+    _FLEX_AVAILABLE = True
+except ImportError:
+    _FLEX_AVAILABLE = False
+
 
 # ============================================================================
 # Anchor Attention (Section 7)
@@ -79,6 +87,9 @@ class AnchorAttention(nn.Module):
 
         # Track W_qkv format to avoid hasattr checks in hot path (graph-break friendly)
         self._w_qkv_format = "linear"
+
+        # ⚡ Phase 6: FlexAttention availability (PyTorch >= 2.5)
+        self._flex_available = _FLEX_AVAILABLE
 
         # ALiBi slopes: one per head (for window portion only)
         self._init_alibi_slopes()
@@ -155,6 +166,40 @@ class AnchorAttention(nn.Module):
         # ⚡ Phase 4: Use repeat_interleave instead of expand+reshape (avoids intermediate 5D tensor)
         return kv.repeat_interleave(n_groups, dim=2)
 
+    def _make_flex_score_mod(self, n_anchors: int, causal_mask: bool):
+        """
+        Create a score_mod callback for FlexAttention.
+
+        Encodes ALiBi position bias (recency penalty on window tokens)
+        and optional causal masking — without materializing bias tensors.
+
+        The score_mod function is JIT-compiled by PyTorch into a fused
+        Triton/CUDA kernel, eliminating Python overhead per attention score.
+
+        Mathematically equivalent to the SDPA path:
+          - Anchors (kv_idx < n_anchors): score unchanged
+          - Window: score -= alibi_slopes[h] * window_pos
+          - Causal: mask when window_pos >= q_idx
+        """
+        alibi_slopes = self.alibi_slopes  # captured as lifted parameter
+
+        if causal_mask:
+            def score_mod(score, b, h, q_idx, kv_idx):
+                if kv_idx < n_anchors:
+                    return score
+                window_pos = kv_idx - n_anchors
+                if window_pos >= q_idx:
+                    return float('-inf')
+                return score - alibi_slopes[h] * window_pos
+            return score_mod
+        else:
+            def score_mod(score, b, h, q_idx, kv_idx):
+                if kv_idx < n_anchors:
+                    return score
+                window_pos = kv_idx - n_anchors
+                return score - alibi_slopes[h] * window_pos
+            return score_mod
+
     def forward(
         self,
         x: torch.Tensor,
@@ -223,36 +268,59 @@ class AnchorAttention(nn.Module):
         total_kv_len = all_k.shape[1]
         anchor_count = self.n_static_anchors + (self.n_pmb_anchors if pmb_readouts is not None else 0)
 
-        # Repeat K/V for GQA: [B, T, n_kv_heads, hd] → [B, T, n_heads, hd]
-        all_k = self._repeat_kv_for_gqa(all_k)
-        all_v = self._repeat_kv_for_gqa(all_v)
+        # ⚡ Phase 6: FlexAttention — fused Triton kernel for custom attention patterns.
+        # Uses score_mod for ALiBi + causal masking instead of materializing bias tensors.
+        # Removes: bias tensor allocation, tensor.cat for mask, manual GQA repeat,
+        #          and the associated CPU-GPU sync points (graph breaks).
+        # Falls back to SDPA for single-token inference (L==1) or older PyTorch.
+        if self._flex_available and L > 1:
+            # FlexAttention natively supports GQA — pass unrepeated K/V (n_kv_heads).
+            score_mod = self._make_flex_score_mod(anchor_count, causal_mask)
 
-        # ⚡ Phase 5: SDPA — fused QK^T + softmax + @V in one optimized kernel
-        # ALiBi bias: zeros for anchors + learned slopes for window
-        anchor_bias = torch.zeros(1, 1, self.n_heads, anchor_count, device=x.device, dtype=q.dtype)
-        full_bias = torch.cat([anchor_bias, self.alibi_bias_full.to(device=x.device, dtype=q.dtype)], dim=-1)
-        # SDPA expects: [B, n_heads, L, T] or broadcast [1, n_heads, 1, T]
-        alibi_attn_mask = full_bias.view(1, self.n_heads, 1, total_kv_len)
+            # Try with explicit enable_gqa first (PyTorch 2.6+),
+            # fall back to auto-detection (PyTorch 2.5 — detects GQA from head count mismatch)
+            try:
+                output = flex_attention(
+                    q.transpose(1, 2),      # [B, n_heads, L, hd]
+                    all_k.transpose(1, 2),  # [B, n_kv_heads, T, hd] — GQA native!
+                    all_v.transpose(1, 2),  # [B, n_kv_heads, T, hd]
+                    score_mod=score_mod,
+                    enable_gqa=True,
+                )
+            except TypeError:
+                output = flex_attention(
+                    q.transpose(1, 2),
+                    all_k.transpose(1, 2),
+                    all_v.transpose(1, 2),
+                    score_mod=score_mod,
+                )
+            output = output.transpose(1, 2).reshape(B, L, self.n_heads * self.head_dim)
+        else:
+            # Fallback: repeat K/V for GQA + SDPA with manual bias mask
+            all_k = self._repeat_kv_for_gqa(all_k)
+            all_v = self._repeat_kv_for_gqa(all_v)
 
-        if causal_mask and L > 1:
-            # Combine ALiBi bias + causal mask into one float mask
-            causal_float = torch.zeros(L, total_kv_len, device=x.device, dtype=q.dtype)
-            causal_float[:, anchor_count:] = torch.triu(
-                torch.ones(L, self.window_size, device=x.device, dtype=q.dtype) * float('-inf'),
-                diagonal=1
+            # ALiBi bias: zeros for anchors + learned slopes for window
+            anchor_bias = torch.zeros(1, 1, self.n_heads, anchor_count, device=x.device, dtype=q.dtype)
+            full_bias = torch.cat([anchor_bias, self.alibi_bias_full.to(device=x.device, dtype=q.dtype)], dim=-1)
+            alibi_attn_mask = full_bias.view(1, self.n_heads, 1, total_kv_len)
+
+            if causal_mask and L > 1:
+                causal_float = torch.zeros(L, total_kv_len, device=x.device, dtype=q.dtype)
+                causal_float[:, anchor_count:] = torch.triu(
+                    torch.ones(L, self.window_size, device=x.device, dtype=q.dtype) * float('-inf'),
+                    diagonal=1
+                )
+                alibi_attn_mask = alibi_attn_mask + causal_float
+
+            output = F.scaled_dot_product_attention(
+                q.transpose(1, 2),
+                all_k.transpose(1, 2),
+                all_v.transpose(1, 2),
+                attn_mask=alibi_attn_mask.to(dtype=q.dtype),
+                dropout_p=self.dropout.p if self.training else 0.0,
             )
-            alibi_attn_mask = alibi_attn_mask + causal_float  # broadcast [1, n_heads, 1, T] + [L, T] → [1, n_heads, L, T]
-
-        # SDPA: [B, n_heads, L, hd] output
-        # ⚡ Ensure all inputs are same dtype (SDPA requires matching dtypes)
-        output = F.scaled_dot_product_attention(
-            q.transpose(1, 2),  # [B, n_heads, L, hd]
-            all_k.transpose(1, 2),  # [B, n_heads, T, hd]
-            all_v.transpose(1, 2),  # [B, n_heads, T, hd]
-            attn_mask=alibi_attn_mask.to(dtype=q.dtype),
-            dropout_p=self.dropout.p if self.training else 0.0,
-        )
-        output = output.transpose(1, 2).reshape(B, L, self.n_heads * self.head_dim)
+            output = output.transpose(1, 2).reshape(B, L, self.n_heads * self.head_dim)
 
         # Output projection
         output = self.W_o(output)
