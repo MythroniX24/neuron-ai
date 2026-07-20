@@ -437,9 +437,7 @@ class ContinuumSpeculativeDecoder:
         """
         Use the DRAFT (Nano, 5M) model to generate K candidate tokens.
 
-        The draft model runs from its own state. On the first call after prefill,
-        uses stored next_logits from prefill. On subsequent calls, advances from
-        the last generated token.
+        ⚡ Optimized: pre-allocated tensor buffer, no Python tensor creation in hot loop.
         """
         draft_model = self.draft_model
         draft_fwd = draft_model.forward
@@ -447,30 +445,31 @@ class ContinuumSpeculativeDecoder:
         eos_id = draft_model.config.eos_token_id
         draft_sample = self.draft_engine._fast_sample
 
-        draft_tokens = []
         draft_glt = self.draft_engine.glt_states
         draft_win = self.draft_engine.window_caches
 
         # Get initial logits: from stored prefill or from last generated token
         if self._draft_next_logits is not None:
-            # First step after prefill: use stored logits
             next_logits = self._draft_next_logits
-            self._draft_next_logits = None  # Clear for next calls
+            self._draft_next_logits = None
         elif generated_tokens.numel() > 0:
-            # Subsequent steps: advance draft from last generated token
             last_token = generated_tokens[-1:].unsqueeze(0)  # [1, 1]
             result = draft_fwd(last_token, draft_glt, draft_win)
             draft_glt = result["glt_states"]
             draft_win = result["window_caches"]
             next_logits = result["logits"][:, -1, :]
         else:
-            # No logits available — shouldn't happen
             return []
 
+        # ⚡ Pre-allocate draft buffer and single-element tensor (no allocs in hot loop)
+        draft_buf = torch.full((num_drafts,), -1, dtype=torch.long, device=self.device)
+        token_tensor = torch.zeros((1, 1), dtype=torch.long, device=self.device)
+        n_drafted = 0
+
         for i in range(num_drafts):
-            # Sample next draft token
-            # Pass previously drafted tokens within this batch for rep_penalty
-            batch_drafted = torch.tensor(draft_tokens, device=self.device, dtype=torch.long) if draft_tokens else torch.tensor([], device=self.device, dtype=torch.long)
+            # Build generated_tokens view: previously DRAFTED + historically generated
+            gen_view = generated_tokens if n_drafted == 0 else torch.cat([generated_tokens, draft_buf[:n_drafted]])
+
             next_token_tensor = draft_sample(
                 next_logits,
                 temperature=temperature,
@@ -478,26 +477,28 @@ class ContinuumSpeculativeDecoder:
                 top_p=top_p,
                 vocab_size=vocab_size,
                 repetition_penalty=repetition_penalty,
-                generated_tokens=batch_drafted,
+                generated_tokens=gen_view if gen_view.numel() > 0 else torch.tensor([], device=self.device, dtype=torch.long),
             )
+
+            # ⚡ In-place: write into pre-allocated buffer instead of Python list.append
             token_id = int(next_token_tensor[0, 0])
-            draft_tokens.append(token_id)
+            draft_buf[n_drafted] = token_id
+            n_drafted += 1
 
             if token_id == eos_id:
                 break
 
-            # Forward draft on new token to get next logits
-            prev_token = torch.tensor([[token_id]], device=self.device)
-            result = draft_fwd(prev_token, draft_glt, draft_win)
+            # ⚡ In-place: reuse single token tensor (no torch.tensor creation)
+            token_tensor[0, 0] = token_id
+            result = draft_fwd(token_tensor, draft_glt, draft_win)
             draft_glt = result["glt_states"]
             draft_win = result["window_caches"]
             next_logits = result["logits"][:, -1, :]
 
-        # Save draft states for next iteration
         self.draft_engine.glt_states = draft_glt
         self.draft_engine.window_caches = draft_win
 
-        return draft_tokens
+        return draft_buf[:n_drafted].tolist()
 
     def _verify_tokens(
         self,
@@ -541,35 +542,28 @@ class ContinuumSpeculativeDecoder:
 
         accepted_tokens = []
         rejected = False
-        final_glt = saved_glt
-        final_win = saved_win
 
         for i in range(len(draft_tokens)):
             if rejected:
                 break
 
-            # Target's argmax prediction at position i
-            logits_i = batch_logits[:, i, :]  # [1, vocab_size]
+            logits_i = batch_logits[:, i, :]
             target_pred = int(logits_i.argmax(dim=-1)[0])
 
             if target_pred == draft_tokens[i]:
-                # Accepted!
                 accepted_tokens.append(draft_tokens[i])
-                # Advance target state to position i+1
-                # We need the target state at this position
-                # Since target forward processed all K tokens, state is at position K
-                # We need to re-run target for accepted tokens only
             else:
-                # Rejected! Use target's prediction
                 accepted_tokens.append(target_pred)
                 rejected = True
 
-        if accepted_tokens:
-            # Re-run target on accepted tokens to get correct state
-            accepted_tensor = torch.tensor([accepted_tokens], device=self.device)
-            result = target_fwd(accepted_tensor, saved_glt, saved_win)
-            final_glt = result["glt_states"]
-            final_win = result["window_caches"]
+        if not accepted_tokens:
+            return [], (saved_glt, saved_win)
+
+        # Re-run target on accepted tokens to get correct state
+        accepted_tensor = torch.tensor([accepted_tokens], device=self.device)
+        result = target_fwd(accepted_tensor, saved_glt, saved_win)
+        final_glt = result["glt_states"]
+        final_win = result["window_caches"]
 
         return accepted_tokens, (final_glt, final_win)
 

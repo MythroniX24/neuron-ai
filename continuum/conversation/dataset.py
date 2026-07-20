@@ -448,7 +448,7 @@ class ConversationalDataset:
         num_workers: int = 2,
         pin_memory: bool = True,
         prefetch_factor: int = 4,
-        persistent_workers: bool = True,
+        use_persistent_workers: bool = True,
     ):
         """
         ⚡ Phase 1: Bucket sampler — groups same-length sequences to minimize padding waste.
@@ -575,7 +575,7 @@ class ConversationalDataset:
             collate_fn=collate_fn,
             num_workers=num_workers,
             pin_memory=pin_memory,
-            persistent_workers=persistent_workers and num_workers > 0,
+            persistent_workers=use_persistent_workers and num_workers > 0,
             prefetch_factor=prefetch_factor if num_workers > 0 else None,
         )
     

@@ -872,6 +872,7 @@ class ContinuumModel(nn.Module):
                         F.softmax(sorted_logits, dim=-1), dim=-1
                     )
                     sorted_indices_to_remove = cumulative_probs > top_p
+                    # ⚡ No clone needed — shift right directly, then set first col
                     sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
                     sorted_indices_to_remove[:, 0] = False
                     indices_to_remove = sorted_indices_to_remove.scatter(

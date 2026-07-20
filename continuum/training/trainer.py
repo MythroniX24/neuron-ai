@@ -153,11 +153,10 @@ class ContinuumTrainer:
                 )
 
         # ⚡ GradScaler for AMP (prevents gradient underflow in FP16)
-        # Conservative init_scale + frequent growth checks = stable FP16
+        # Default init_scale=2^16 is well-tested for T4 FP16 training.
+        # Conservative scales can cause underflow on small losses (common early in training).
         self.scaler = torch.amp.GradScaler(
             "cuda",
-            init_scale=2.0 ** 12,  # Start with conservative scale
-            growth_interval=100,     # Check more frequently for overflow
             enabled=self.use_amp,
         ) if self.use_amp else None
         if self.use_amp:
@@ -362,7 +361,7 @@ class ContinuumTrainer:
                     result = self.model.forward(input_ids)
                 logits = result["logits"]
 
-                # ⚡ Remove unnecessary .contiguous() — slices are already contiguous
+                        # ⚡ Slices are already contiguous in memory
                 shift_logits = logits[:, :-1, :]
                 shift_labels = labels[:, 1:]
 
