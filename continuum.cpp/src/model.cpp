@@ -433,6 +433,60 @@ void pmb_write(const Tensor& chunk_summary, PMBWeights& w, Arena& arena) {
 }
 
 // ============================================================================
+// Project static anchors through W_qkv's K/V weight slices
+//
+// Equivalent to Python AnchorAttention.refresh_static_cache():
+//   W_k_w, W_v_w = self._get_kv_weights()
+//   static_k = F.linear(static_anchors, W_k_w)   → [n_static, n_kv, hd]
+//   static_v = F.linear(static_anchors, W_v_w)   → [n_static, n_kv, hd]
+//
+// Called once per forward pass (not per token!) — result cached in AnchorWeights.static_k/v
+// ============================================================================
+void project_static_anchors(AnchorWeights& w, const ModelConfig& cfg, Arena& arena) {
+    int32_t n_static = cfg.n_static_anchors;
+    int32_t kv_dim = cfg.kv_dim;
+    int32_t d_model = cfg.d_model;
+    int32_t qkv_dim = cfg.q_dim + 2 * kv_dim;
+
+    // Allocate projected K/V tensors
+    w.static_k = arena.alloc_tensor(TensorShape(n_static, cfg.n_kv_heads, cfg.head_dim));
+    w.static_v = arena.alloc_tensor(TensorShape(n_static, cfg.n_kv_heads, cfg.head_dim));
+
+    // ⚡ FP16 SAFETY: Use fp16_wire to get FP32 weights even when use_fp16=true.
+    // Without this, reading w.W_qkv.data directly would get FP16 values when
+    // use_fp16 is set, causing a mismatch with anchor_forward's dequantized weights.
+    const float* Wqkv = fp16_wire(w.W_qkv.data, w.W_qkv_fp16, w.use_fp16, arena, (size_t)qkv_dim * d_model);
+
+    // Get K and V weight slices from fused W_qkv.
+    // W_qkv layout in row-major: [q_dim + 2*kv_dim, d_model]
+    //   rows 0..q_dim-1:      Q weights
+    //   rows q_dim..q+kv-1:    K weights
+    //   rows q_dim+kv..q+2kv-1: V weights
+    // In memory: W_qkv.data[i * d_model + j] where i = output index, j = input index
+    const float* Wk = Wqkv + cfg.q_dim * d_model;
+    const float* Wv = Wk + cfg.kv_dim * d_model;
+
+    // Project each static anchor:
+    //   static_k[s, kv_h, hd_d] = sum_j anchor[s, j] * Wk[(kv_h*hd + d), j]
+    //   static_v[s, kv_h, hd_d] = sum_j anchor[s, j] * Wv[(kv_h*hd + d), j]
+    for (int32_t s = 0; s < n_static; s++) {
+        for (int32_t i = 0; i < kv_dim; i++) {
+            float sum_k = 0.0f;
+            float sum_v = 0.0f;
+            for (int32_t j = 0; j < d_model; j++) {
+                float a = w.static_anchors.data[s * d_model + j];
+                sum_k += Wk[i * d_model + j] * a;
+                sum_v += Wv[i * d_model + j] * a;
+            }
+            w.static_k.data[s * kv_dim + i] = sum_k;
+            w.static_v.data[s * kv_dim + i] = sum_v;
+        }
+    }
+
+    w.static_kv_dirty = false;
+}
+
+// ============================================================================
 // Initialize runtime state
 // ============================================================================
 void RuntimeState::init(const ModelConfig& cfg, Arena& arena) {
@@ -474,6 +528,19 @@ void continuum_forward(
     Tensor& logits, RuntimeState& state, const Tensor& token_embed,
     const ModelWeights& weights, const ModelConfig& cfg, Arena& arena) {
 
+    // ⚡ Pre-compute static anchor K/V projections for ALL anchor layers.
+    // This is the C++ equivalent of Python's refresh_static_cache() —
+    // projects raw static_anchors through W_qkv's K and V weight slices.
+    // Done ONCE per forward pass because arena memory is ephemeral:
+    // projected tensors point into arena memory which is freed between calls.
+    // static_k/static_v are `mutable` — no const_cast needed.
+    for (int32_t a = 0; a < cfg.anchor_layers; a++) {
+        project_static_anchors(
+            const_cast<AnchorWeights&>(weights.anchor_layers[a]),
+            cfg, arena
+        );
+    }
+
     // ─── Store hidden state in an arena tensor ───
     auto x = arena.alloc_tensor(TensorShape(cfg.d_model));
     memcpy(x.data, token_embed.data, cfg.d_model * sizeof(float));
@@ -494,8 +561,8 @@ void continuum_forward(
                           state.window_v_caches[anchor_idx],
                           state.pmb_slots,
                           weights.anchor_layers[anchor_idx],
-                          weights.anchor_layers[anchor_idx].static_anchors,
-                          weights.anchor_layers[anchor_idx].static_anchors,
+                          weights.anchor_layers[anchor_idx].static_k,  // ⚡ Projected K!
+                          weights.anchor_layers[anchor_idx].static_v,  // ⚡ Projected V!
                           false, arena);
             anchor_idx++;
         } else {
@@ -526,8 +593,8 @@ void continuum_forward(
                           state.window_v_caches[anchor_idx],
                           state.pmb_slots,
                           weights.anchor_layers[anchor_idx],
-                          weights.anchor_layers[anchor_idx].static_anchors,
-                          weights.anchor_layers[anchor_idx].static_anchors,
+                          weights.anchor_layers[anchor_idx].static_k,  // ⚡ Projected K!
+                          weights.anchor_layers[anchor_idx].static_v,  // ⚡ Projected V!
                           false, arena);
             anchor_idx++;
         } else {
@@ -558,8 +625,8 @@ void continuum_forward(
                           state.window_v_caches[anchor_idx],
                           state.pmb_slots,
                           weights.anchor_layers[anchor_idx],
-                          weights.anchor_layers[anchor_idx].static_anchors,
-                          weights.anchor_layers[anchor_idx].static_anchors,
+                          weights.anchor_layers[anchor_idx].static_k,  // ⚡ Projected K!
+                          weights.anchor_layers[anchor_idx].static_v,  // ⚡ Projected V!
                           false, arena);
             anchor_idx++;
         } else {
