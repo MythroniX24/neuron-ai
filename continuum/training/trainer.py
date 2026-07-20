@@ -196,12 +196,6 @@ class ContinuumTrainer:
             for param_group in self.optimizer.param_groups:
                 param_group["lr"] = self.base_lr * lr_scale
 
-    def _get_autocast_context(self):
-        """Get autocast context manager for AMP if enabled."""
-        if self.use_amp and self.device == "cuda":
-            return torch.amp.autocast("cuda", dtype=torch.float16)
-        return torch.no_grad()  # Fallback — no-op context
-
     def train_step(
         self,
         batch: Dict[str, torch.Tensor],

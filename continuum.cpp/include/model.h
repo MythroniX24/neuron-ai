@@ -198,6 +198,18 @@ struct RuntimeState {
 // Forward declarations — layer forward passes
 // ============================================================================
 
+// ⚡ Phase 9: FP16 weight wiring — returns FP32 pointer from either
+// original weights or dequantized HalfStorage (uses arena for temp buffer)
+inline const float* fp16_wire(const float* fp32, const HalfStorage& hs,
+                               bool use_fp16, Arena& arena, size_t n_floats) {
+    if (use_fp16 && !hs.empty()) {
+        float* buf = arena.alloc(n_floats);
+        hs.dequantize(buf);
+        return buf;
+    }
+    return fp32;
+}
+
 // GLT forward: x[d_model] + state[d_state,d_state] → output[d_model] + new_state
 void glt_forward(Tensor& output, Tensor& new_state,
                  const Tensor& x, const Tensor& state,

@@ -28,15 +28,15 @@ void embed_forward(Tensor& output, int32_t token_id, const EmbedWeights& w, Aren
     int32_t d_embed = w.up_proj.shape.ne[0];    // d_embed (ne[0]=cols, ne[1]=rows → d_embed, d_model)
     int32_t d_model = w.up_proj.shape.ne[1];     // d_model
 
-    (void)arena;
+    // ⚡ Phase 9: FP16 wiring — dequantize into arena if use_fp16
+    const float* emb_ptr = fp16_wire(w.embed_table.data, w.embed_table_fp16, w.use_fp16, arena, (size_t)w.embed_table.shape.ne[0] * d_embed);
+    const float* up_ptr  = fp16_wire(w.up_proj.data, w.up_proj_fp16, w.use_fp16, arena, (size_t)d_model * d_embed);
 
-    // embed_table[token_id, :] → [d_embed]
-    // up_proj: [d_model, d_embed] * embed[d_embed] → output[d_model]
     for (int32_t i = 0; i < d_model; i++) {
         float sum = 0.0f;
         for (int32_t j = 0; j < d_embed; j++) {
-            float emb = w.embed_table.data[token_id * d_embed + j];
-            float up = w.up_proj.data[i * d_embed + j];
+            float emb = emb_ptr[token_id * d_embed + j];
+            float up = up_ptr[i * d_embed + j];
             sum += up * emb;
         }
         output.data[i] = sum;
@@ -47,20 +47,19 @@ void embed_forward(Tensor& output, int32_t token_id, const EmbedWeights& w, Aren
 // Output projection: hidden[d_model] → logits[vocab_size]
 // ============================================================================
 void output_projection(Tensor& logits, const Tensor& hidden, const EmbedWeights& w, Arena& arena) {
-    int32_t d_model = w.down_proj.shape.ne[1];      // d_model  (down_proj: ne[0]=d_embed, ne[1]=d_model)
-    int32_t d_embed = w.down_proj.shape.ne[0];       // d_embed
-    int32_t vocab_size = w.embed_table.shape.ne[0];   // vocab_size  (embed_table: ne[0]=d_embed, ne[1]=vocab)
+    int32_t d_model = w.down_proj.shape.ne[1];
+    int32_t d_embed = w.down_proj.shape.ne[0];
+    int32_t vocab_size = w.embed_table.shape.ne[0];
 
-    (void)arena;
+    // ⚡ Phase 9: FP16 wiring
+    const float* down_ptr = fp16_wire(w.down_proj.data, w.down_proj_fp16, w.use_fp16, arena, (size_t)d_embed * d_model);
+    const float* emb_ptr  = fp16_wire(w.embed_table.data, w.embed_table_fp16, w.use_fp16, arena, (size_t)vocab_size * d_embed);
 
-    // logits = embed_table * (down_proj * hidden)
-    // down_proj: [d_embed, d_model], hidden: [d_model], result: [d_embed]
-    // embed_table: [vocab, d_embed] — logits[v] = sum_e embed_table[v,e] * interm[e]
     auto interm = arena.alloc_tensor(TensorShape(d_embed));
     for (int32_t e = 0; e < d_embed; e++) {
         float sum = 0.0f;
         for (int32_t j = 0; j < d_model; j++) {
-            sum += w.down_proj.data[e * d_model + j] * hidden.data[j];
+            sum += down_ptr[e * d_model + j] * hidden.data[j];
         }
         interm.data[e] = sum;
     }
@@ -68,7 +67,7 @@ void output_projection(Tensor& logits, const Tensor& hidden, const EmbedWeights&
     for (int32_t v = 0; v < vocab_size; v++) {
         float sum = 0.0f;
         for (int32_t e = 0; e < d_embed; e++) {
-            sum += w.embed_table.data[v * d_embed + e] * interm.data[e];
+            sum += emb_ptr[v * d_embed + e] * interm.data[e];
         }
         logits.data[v] = sum;
     }
@@ -94,6 +93,15 @@ void glt_forward(Tensor& output, Tensor& new_state,
     int32_t d_model = w.W_k.shape.ne[1];   // W_k: [d_state, d_model]
     int32_t d_state = w.W_k.shape.ne[0];   // d_state
 
+    // ⚡ Phase 9: FP16 wiring — dequantize all weight matrices once into arena
+    const float* Wk = fp16_wire(w.W_k.data, w.W_k_fp16, w.use_fp16, arena, (size_t)d_state * d_model);
+    const float* Wv = fp16_wire(w.W_v.data, w.W_v_fp16, w.use_fp16, arena, (size_t)d_state * d_model);
+    const float* Wq = fp16_wire(w.W_q.data, w.W_q_fp16, w.use_fp16, arena, (size_t)d_state * d_model);
+    const float* Wg = fp16_wire(w.W_gamma.data, w.W_gamma_fp16, w.use_fp16, arena, (size_t)d_state * d_model);
+    const float* Wi = fp16_wire(w.W_iota.data, w.W_iota_fp16, w.use_fp16, arena, (size_t)d_state * d_model);
+    const float* Wr = fp16_wire(w.W_r.data, w.W_r_fp16, w.use_fp16, arena, (size_t)d_state * d_model);
+    const float* Wo = fp16_wire(w.W_o.data, w.W_o_fp16, w.use_fp16, arena, (size_t)d_model * d_state);
+
     auto xn  = arena.alloc_tensor(TensorShape(d_model));
     auto k   = arena.alloc_tensor(TensorShape(d_state));
     auto v   = arena.alloc_tensor(TensorShape(d_state));
@@ -112,9 +120,9 @@ void glt_forward(Tensor& output, Tensor& new_state,
         float ks = 0, vs = 0, qs = 0;
         for (int32_t j = 0; j < d_model; j++) {
             float xn_j = xn.data[j];
-            ks += w.W_k.data[i * d_model + j] * xn_j;
-            vs += w.W_v.data[i * d_model + j] * xn_j;
-            qs += w.W_q.data[i * d_model + j] * xn_j;
+            ks += Wk[i * d_model + j] * xn_j;
+            vs += Wv[i * d_model + j] * xn_j;
+            qs += Wq[i * d_model + j] * xn_j;
         }
         k.data[i] = ks;
         v.data[i] = vs;
@@ -132,9 +140,9 @@ void glt_forward(Tensor& output, Tensor& new_state,
         float rs = w.r_bias.data[i];
         for (int32_t j = 0; j < d_model; j++) {
             float xn_j = xn.data[j];
-            gs += w.W_gamma.data[i * d_model + j] * xn_j;
-            is_ += w.W_iota.data[i * d_model + j] * xn_j;
-            rs += w.W_r.data[i * d_model + j] * xn_j;
+            gs += Wg[i * d_model + j] * xn_j;
+            is_ += Wi[i * d_model + j] * xn_j;
+            rs += Wr[i * d_model + j] * xn_j;
         }
         gamma.data[i] = 1.0f / (1.0f + std::exp(-gs));
         iota.data[i]  = 1.0f / (1.0f + std::exp(-is_));
@@ -142,8 +150,6 @@ void glt_forward(Tensor& output, Tensor& new_state,
     }
 
     // 5+6. Outer product + state update
-    // outer[i,j] = k[i] * v[j]
-    // S_new[i,j] = gamma[i] * S_old[i,j] + iota[i] * k[i] * v[j]
     for (int32_t i = 0; i < d_state; i++) {
         float gi = gamma.data[i];
         float ii = iota.data[i];
@@ -172,7 +178,7 @@ void glt_forward(Tensor& output, Tensor& new_state,
     for (int32_t i = 0; i < d_model; i++) {
         float sum = 0.0f;
         for (int32_t j = 0; j < d_state; j++) {
-            sum += w.W_o.data[i * d_state + j] * rh.data[j];
+            sum += Wo[i * d_state + j] * rh.data[j];
         }
         output.data[i] = sum + x.data[i];  // residual
     }
@@ -200,17 +206,20 @@ void anchor_forward(Tensor& output, Tensor& new_wk, Tensor& new_wv,
 
     (void)causal_mask;
 
+    // ⚡ Phase 9: FP16 wiring
+    int32_t qkv_dim = q_dim + 2 * kv_dim;
+    const float* Wqkv = fp16_wire(w.W_qkv.data, w.W_qkv_fp16, w.use_fp16, arena, (size_t)qkv_dim * d_model);
+
     // 1. Pre-norm
     auto xn = arena.alloc_tensor(TensorShape(d_model));
     rms_norm_forward(xn, x, w.norm_scale, 1e-6f);
 
     // 2. Fused QKV projection → qkv [q_dim + 2*kv_dim]
-    int32_t qkv_dim = q_dim + 2 * kv_dim;
     auto qkv = arena.alloc_tensor(TensorShape(qkv_dim));
     for (int32_t i = 0; i < qkv_dim; i++) {
         float sum = 0.0f;
         for (int32_t j = 0; j < d_model; j++) {
-            sum += w.W_qkv.data[i * d_model + j] * xn.data[j];
+            sum += Wqkv[i * d_model + j] * xn.data[j];
         }
         qkv.data[i] = sum;
     }
@@ -284,11 +293,12 @@ void anchor_forward(Tensor& output, Tensor& new_wk, Tensor& new_wv,
     }
 
     // 4. Output projection: W_o @ attention_output
+    const float* Wo_anchor = fp16_wire(w.W_o.data, w.W_o_fp16, w.use_fp16, arena, (size_t)d_model * q_dim);
     auto attn_out = arena.alloc_tensor(TensorShape(d_model));
     for (int32_t i = 0; i < d_model; i++) {
         float sum = 0.0f;
         for (int32_t j = 0; j < q_dim; j++) {
-            sum += w.W_o.data[i * q_dim + j] * output.data[j];
+            sum += Wo_anchor[i * q_dim + j] * output.data[j];
         }
         attn_out.data[i] = sum;
     }
@@ -318,6 +328,12 @@ void ffn_forward(Tensor& output, const Tensor& x, const FFNWeights& w, Arena& ar
     int32_t n_shards = w.gate_head.shape.ne[0];
     int32_t shard_inter = total_inter / n_shards;
 
+    // ⚡ Phase 9: FP16 wiring
+    const float* Gp = fp16_wire(w.gate_proj_fused.data, w.gate_proj_fp16, w.use_fp16, arena, (size_t)total_inter * d_model);
+    const float* Up = fp16_wire(w.up_proj_fused.data, w.up_proj_fp16, w.use_fp16, arena, (size_t)total_inter * d_model);
+    const float* Dp = fp16_wire(w.down_proj_fused.data, w.down_proj_fp16, w.use_fp16, arena, (size_t)d_model * total_inter);
+    const float* Gh = fp16_wire(w.gate_head.data, w.gate_head_fp16, w.use_fp16, arena, (size_t)n_shards * d_model);
+
     // 1. Pre-norm
     auto xn = arena.alloc_tensor(TensorShape(d_model));
     rms_norm_forward(xn, x, w.norm_scale, 1e-6f);
@@ -327,7 +343,7 @@ void ffn_forward(Tensor& output, const Tensor& x, const FFNWeights& w, Arena& ar
     for (int32_t s = 0; s < n_shards; s++) {
         float g = w.gate_head_bias.data[s];
         for (int32_t j = 0; j < d_model; j++)
-            g += w.gate_head.data[s * d_model + j] * xn.data[j];
+            g += Gh[s * d_model + j] * xn.data[j];
         gates.data[s] = 1.0f / (1.0f + std::exp(-g));
     }
 
@@ -336,8 +352,8 @@ void ffn_forward(Tensor& output, const Tensor& x, const FFNWeights& w, Arena& ar
     for (int32_t i = 0; i < total_inter; i++) {
         float gp = 0, up = 0;
         for (int32_t j = 0; j < d_model; j++) {
-            gp += w.gate_proj_fused.data[i * d_model + j] * xn.data[j];
-            up += w.up_proj_fused.data[i * d_model + j] * xn.data[j];
+            gp += Gp[i * d_model + j] * xn.data[j];
+            up += Up[i * d_model + j] * xn.data[j];
         }
         float silu_gp = gp / (1.0f + std::exp(-gp));
         float gated = gates.data[i / shard_inter] * silu_gp * up;
@@ -349,7 +365,7 @@ void ffn_forward(Tensor& output, const Tensor& x, const FFNWeights& w, Arena& ar
     for (int32_t i = 0; i < d_model; i++) {
         float sum = 0;
         for (int32_t j = 0; j < total_inter; j++) {
-            sum += w.down_proj_fused.data[i * total_inter + j] * swiglu.data[j];
+            sum += Dp[i * total_inter + j] * swiglu.data[j];
         }
         output.data[i] = sum;
     }
