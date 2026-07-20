@@ -425,8 +425,9 @@ class ContinuumModel(nn.Module):
             entry_states.append(x)
 
             # Check if all batch items want to halt
+            # ⚡ Phase 7: Direct tensor comparison (no .item()) — torch.compile friendly, no graph break
             cumulative_p = torch.stack(halting_probs, dim=0).sum(dim=0)  # [B, 1]
-            if cumulative_p.min().item() >= config.halt_threshold:
+            if cumulative_p.min() >= config.halt_threshold:
                 break
 
         # ACT-style weighted combination
