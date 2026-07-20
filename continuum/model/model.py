@@ -594,7 +594,7 @@ class ContinuumModel(nn.Module):
                 W_k_w, W_v_w = block.mixer._get_kv_weights()
                 kv_all = F.linear(last_x, torch.cat([W_k_w, W_v_w], dim=0))  # [B, actual_ws, 2*kv_dim]
                 new_wk_flat, new_wv_flat = kv_all.split(
-                    [block.mixer.q_dim, block.mixer.kv_dim, block.mixer.kv_dim], dim=-1
+                    [block.mixer.kv_dim, block.mixer.kv_dim], dim=-1
                 )
                 
                 # Pad with zeros on the LEFT if fewer tokens than window_size.
