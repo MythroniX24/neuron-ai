@@ -635,38 +635,110 @@ void continuum_forward(
         memcpy(x.data, tmp2.data, cfg.d_model * sizeof(float));
     }
 
-    // ─── Stage 2: Reasoning Core ───
-    for (int32_t l = 0; l < cfg.core_layers; l++) {
-        int32_t abs_l = cfg.perception_layers + l;
-        bool is_anchor = (anchor_idx < cfg.anchor_layers) &&
-                         (abs_l % 3 == 0 || glt_idx >= cfg.glt_layers);
+    // ─── Stage 2: Reasoning Core — ADL (Adaptive Depth Looping) ───
+    // Python equivalent: _run_stage_core() with n_loops_max > 1
+    // Loops 1..N_max times, halting head decides when to stop.
+    // After the loop, combines states using ACT-style weighted average.
+    //
+    // GLT states and window caches at core positions accumulate across
+    // loop iterations: each loop reads the UPDATED state from the previous
+    // loop (same glt_idx/anchor_idx on each iteration).
+    int32_t core_glt_base = glt_idx;
+    int32_t core_anchor_base = anchor_idx;
+    float cumulative_p = 0.0f;
+    int32_t n_loops = 0;
 
-        auto tmp = arena.alloc_tensor(TensorShape(cfg.d_model));
+    // Store entry states and halting probabilities for ACT combination
+    std::vector<Tensor> entry_states;
+    std::vector<float> halting_probs;
+    entry_states.reserve(cfg.n_max_loops);
+    halting_probs.reserve(cfg.n_max_loops);
 
-        if (is_anchor) {
-            anchor_forward(tmp, state.window_k_caches[anchor_idx],
-                          state.window_v_caches[anchor_idx],
-                          x, state.window_k_caches[anchor_idx],
-                          state.window_v_caches[anchor_idx],
-                          pmb_proj_k[anchor_idx],  // ⚡ Projected PMB K!
-                          pmb_proj_v[anchor_idx],  // ⚡ Projected PMB V!
-                          weights.anchor_layers[anchor_idx],
-                          weights.anchor_layers[anchor_idx].static_k,
-                          weights.anchor_layers[anchor_idx].static_v,
-                          false, arena);
-            anchor_idx++;
-        } else {
-            auto new_s = arena.alloc_tensor(TensorShape(cfg.d_state, cfg.d_state));
-            glt_forward(tmp, new_s, x, state.glt_states[glt_idx],
-                       weights.glt_layers[glt_idx], arena);
-            state.glt_states[glt_idx] = std::move(new_s);
-            glt_idx++;
+    while (n_loops < cfg.n_max_loops) {
+        // Save entry state BEFORE this core pass (for ACT combination)
+        auto entry_x = arena.alloc_tensor(TensorShape(cfg.d_model));
+        memcpy(entry_x.data, x.data, cfg.d_model * sizeof(float));
+        entry_states.push_back(std::move(entry_x));
+
+        // Reset indices to core's base — state/cache memory persists across loops
+        glt_idx = core_glt_base;
+        anchor_idx = core_anchor_base;
+
+        // Run core blocks (same logic as single-pass, but with reset indices)
+        for (int32_t l = 0; l < cfg.core_layers; l++) {
+            int32_t abs_l = cfg.perception_layers + l;
+            bool is_anchor = (anchor_idx < cfg.anchor_layers) &&
+                             (abs_l % 3 == 0 || glt_idx >= cfg.glt_layers);
+
+            auto tmp = arena.alloc_tensor(TensorShape(cfg.d_model));
+
+            if (is_anchor) {
+                anchor_forward(tmp, state.window_k_caches[anchor_idx],
+                              state.window_v_caches[anchor_idx],
+                              x, state.window_k_caches[anchor_idx],
+                              state.window_v_caches[anchor_idx],
+                              pmb_proj_k[anchor_idx],
+                              pmb_proj_v[anchor_idx],
+                              weights.anchor_layers[anchor_idx],
+                              weights.anchor_layers[anchor_idx].static_k,
+                              weights.anchor_layers[anchor_idx].static_v,
+                              false, arena);
+                anchor_idx++;
+            } else {
+                auto new_s = arena.alloc_tensor(TensorShape(cfg.d_state, cfg.d_state));
+                glt_forward(tmp, new_s, x, state.glt_states[glt_idx],
+                           weights.glt_layers[glt_idx], arena);
+                state.glt_states[glt_idx] = std::move(new_s);
+                glt_idx++;
+            }
+
+            auto tmp2 = arena.alloc_tensor(TensorShape(cfg.d_model));
+            ffn_forward(tmp2, tmp, weights.ffn_layers[abs_l], arena);
+            memcpy(x.data, tmp2.data, cfg.d_model * sizeof(float));
         }
 
-        auto tmp2 = arena.alloc_tensor(TensorShape(cfg.d_model));
-        ffn_forward(tmp2, tmp, weights.ffn_layers[abs_l], arena);
-        memcpy(x.data, tmp2.data, cfg.d_model * sizeof(float));
+        // Halting decision
+        float p = halting_forward(x, weights.halting, arena);
+        halting_probs.push_back(p);
+        cumulative_p += p;
+        n_loops++;
+
+        if (cumulative_p >= cfg.halt_threshold) {
+            break;
+        }
     }
+
+    // ACT-style weighted combination (Python: Adaptive Computation Time)
+    // Weight each loop's entry state by its halting probability.
+    // Last probability absorbs remaining probability mass (correct ACT remainder).
+    if (n_loops > 1) {
+        // Compute total probability from first n-1 loops
+        float sum_first = 0.0f;
+        for (int i = 0; i < n_loops - 1; i++) {
+            sum_first += halting_probs[i];
+        }
+        // Last halting prob = remainder (1.0 - sum of first n-1)
+        halting_probs[n_loops - 1] = 1.0f - std::min(std::max(sum_first, 0.0f), 1.0f);
+
+        // ⚡ Zero out x first (essential — x currently contains last Core pass output!)
+        memset(x.data, 0, cfg.d_model * sizeof(float));
+        // Weighted combination: x = Σ w_i * state_i / Σ w_i
+        float total_w = 0.0f;
+        for (int i = 0; i < n_loops; i++) {
+            float w = halting_probs[i];
+            if (w <= 0.0f) continue;
+            for (int32_t j = 0; j < cfg.d_model; j++) {
+                x.data[j] += w * entry_states[i].data[j];
+            }
+            total_w += w;
+        }
+        // Normalize
+        float inv_w = 1.0f / std::max(total_w, 1e-8f);
+        for (int32_t j = 0; j < cfg.d_model; j++) {
+            x.data[j] *= inv_w;
+        }
+    }
+    // Single loop (n_loops == 1): just keep current x (no weighting needed)
 
     // ─── Stage 3: Output ───
     for (int32_t l = 0; l < cfg.output_layers; l++) {
