@@ -225,11 +225,14 @@ void glt_forward(Tensor& output, Tensor& new_state,
                  const Tensor& x, const Tensor& state,
                  const GLTWeights& w, Arena& arena);
 
-// Anchor Attention forward: x + window_kv + pmb → output
+// Anchor Attention forward: x + window_kv + pmb_k/v → output
+// pmb_k, pmb_v are top-k PMB readouts PROJECTED through W_qkv K/V slices,
+// shape [n_pmb_anchors, n_kv_heads, head_dim] — same layout as static_k, static_v.
 void anchor_forward(Tensor& output, Tensor& new_wk, Tensor& new_wv,
                     const Tensor& x, const Tensor& window_k, const Tensor& window_v,
-                    const Tensor& pmb_readouts, const AnchorWeights& w,
-                    const Tensor& static_kv_k, const Tensor& static_kv_v,
+                    const Tensor& pmb_k, const Tensor& pmb_v,
+                    const AnchorWeights& w,
+                    const Tensor& static_k, const Tensor& static_v,
                     bool causal_mask, Arena& arena);
 
 // GatedShardFFN forward: x → output (pre-norm + residual inside)

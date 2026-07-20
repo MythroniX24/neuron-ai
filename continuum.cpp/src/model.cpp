@@ -189,7 +189,8 @@ void glt_forward(Tensor& output, Tensor& new_state,
 // ============================================================================
 void anchor_forward(Tensor& output, Tensor& new_wk, Tensor& new_wv,
                     const Tensor& x, const Tensor& window_k, const Tensor& window_v,
-                    const Tensor& pmb_readouts, const AnchorWeights& w,
+                    const Tensor& pmb_k, const Tensor& pmb_v,
+                    const AnchorWeights& w,
                     const Tensor& static_k, const Tensor& static_v,
                     bool causal_mask, Arena& arena) {
     int32_t d_model = w.norm_scale.shape.ne[0];
@@ -200,7 +201,7 @@ void anchor_forward(Tensor& output, Tensor& new_wk, Tensor& new_wv,
     int32_t kv_dim = n_kv * head_dim;
     int32_t window_size = window_k.shape.ne[0];
     int32_t n_static = static_k.shape.ne[0];
-    int32_t n_pmb = pmb_readouts.shape.ne[0];
+    int32_t n_pmb = pmb_k.shape.ne[0];
     int32_t total_kv = n_static + n_pmb + window_size;
     int32_t n_groups = n_heads / n_kv;
 
@@ -244,12 +245,16 @@ void anchor_forward(Tensor& output, Tensor& new_wk, Tensor& new_wv,
                 float q_val = q_ptr[h * head_dim + d];
                 float k_val = 0.0f;
                 if (t < n_static) {
-                    k_val = static_k.data[t * n_kv * head_dim + kv_h * head_dim + d];
+                    // Static anchors: [n_static, n_kv, hd] — stride n_kv*hd = kv_dim
+                    k_val = static_k.data[t * kv_dim + kv_h * head_dim + d];
                 } else if (t < n_static + n_pmb) {
-                    k_val = pmb_readouts.data[(t - n_static) * d_model + kv_h * head_dim + d];
+                    // ⚡ PMB readouts: projected through W_qkv K/V, shape [n_pmb, n_kv, hd]
+                    // Same layout as static anchors — uses kv_dim stride, NOT d_model!
+                    int32_t pmb_idx = t - n_static;
+                    k_val = pmb_k.data[pmb_idx * kv_dim + kv_h * head_dim + d];
                 } else {
                     int32_t wp = t - n_static - n_pmb;
-                    k_val = window_k.data[wp * n_kv * head_dim + kv_h * head_dim + d];
+                    k_val = window_k.data[wp * kv_dim + kv_h * head_dim + d];
                 }
                 s += q_val * k_val;
             }
@@ -273,18 +278,19 @@ void anchor_forward(Tensor& output, Tensor& new_wk, Tensor& new_wv,
         }
         float inv = 1.0f / (sum_exp + 1e-10f);
 
-        // Weighted sum of V
+        // Weighted sum of V — same layout as K (static, pmb, window all use kv_dim stride)
         for (int32_t d = 0; d < head_dim; d++) {
             float sum = 0.0f;
             for (int32_t t = 0; t < total_kv; t++) {
                 float v_val = 0.0f;
                 if (t < n_static) {
-                    v_val = static_v.data[t * n_kv * head_dim + kv_h * head_dim + d];
+                    v_val = static_v.data[t * kv_dim + kv_h * head_dim + d];
                 } else if (t < n_static + n_pmb) {
-                    v_val = pmb_readouts.data[(t - n_static) * d_model + kv_h * head_dim + d];
+                    int32_t pmb_idx = t - n_static;
+                    v_val = pmb_v.data[pmb_idx * kv_dim + kv_h * head_dim + d];
                 } else {
                     int32_t wp = t - n_static - n_pmb;
-                    v_val = window_v.data[wp * n_kv * head_dim + kv_h * head_dim + d];
+                    v_val = window_v.data[wp * kv_dim + kv_h * head_dim + d];
                 }
                 sum += scores.data[t] * inv * v_val;
             }
@@ -400,6 +406,7 @@ float halting_forward(const Tensor& hidden, const HaltingWeights& w, Arena& aren
 
 // ============================================================================
 // PMB read: query[d_model] → top-k readouts[n_readout, d_model]
+// ⚡ Proper top-k selection using similarity scores!
 // ============================================================================
 void pmb_read(Tensor& readouts, const Tensor& query, const PMBWeights& w, Arena& arena) {
     int32_t n_slots = w.slots.shape.ne[0];
@@ -408,6 +415,7 @@ void pmb_read(Tensor& readouts, const Tensor& query, const PMBWeights& w, Arena&
 
     auto scores = arena.alloc_tensor(TensorShape(n_slots));
 
+    // Compute similarity: score[s] = write_scale * (query · slot[s])
     for (int32_t s = 0; s < n_slots; s++) {
         float sim = 0;
         for (int32_t d = 0; d < d_model; d++)
@@ -415,10 +423,23 @@ void pmb_read(Tensor& readouts, const Tensor& query, const PMBWeights& w, Arena&
         scores.data[s] = sim * w.write_scale;
     }
 
-    // Take first n_readout slots (placeholder for actual top-k selection)
-    for (int32_t k = 0; k < n_readout && k < n_slots; k++) {
-        memcpy(readouts.data + k * d_model,
-               w.slots.data + k * d_model,
+    // ⚡ Top-k selection (max 64 slots — stack allocation is fine)
+    // Find k slots with highest similarity scores.
+    int32_t k = (n_readout < n_slots) ? n_readout : n_slots;
+    bool used[64] = {false};  // n_slots max = 64 for all model tiers
+
+    for (int32_t ki = 0; ki < k; ki++) {
+        int32_t best_s = 0;
+        float best_score = -1e30f;
+        for (int32_t s = 0; s < n_slots; s++) {
+            if (!used[s] && scores.data[s] > best_score) {
+                best_score = scores.data[s];
+                best_s = s;
+            }
+        }
+        used[best_s] = true;
+        memcpy(readouts.data + ki * d_model,
+               w.slots.data + best_s * d_model,
                d_model * sizeof(float));
     }
 }
@@ -530,11 +551,50 @@ void continuum_forward(
     // ⚡ Pre-compute static anchor K/V projections for ALL anchor layers.
     // This is the C++ equivalent of Python's refresh_static_cache() —
     // projects raw static_anchors through W_qkv's K and V weight slices.
-    // Done ONCE per forward pass because arena memory is ephemeral:
-    // projected tensors point into arena memory which is freed between calls.
-    // static_k/static_v are `mutable` — writable through const ref, no const_cast needed.
     for (int32_t a = 0; a < cfg.anchor_layers; a++) {
         project_static_anchors(weights.anchor_layers[a], cfg, arena);
+    }
+
+    // ⚡ Pre-compute PMB top-k readouts + K/V projections for ALL anchor layers.
+    // Each anchor layer has its own W_qkv with different K/V projections.
+    // PMB read: query = token_embed (mean-pooled across batch → single token query)
+    // stored in arena temps — re-computed each forward since arena is reset.
+    // pmb_readouts_proj_k/v shape: [n_pmb_anchors, n_kv_heads, head_dim]
+    int32_t n_pmb = cfg.n_pmb_anchors;
+    int32_t kv_dim = cfg.kv_dim;
+    auto pmb_raw = arena.alloc_tensor(TensorShape(n_pmb, cfg.d_model));
+    pmb_read(pmb_raw, token_embed, weights.pmb, arena);  // top-k readouts
+
+    // Project PMB readouts through each anchor layer's W_qkv K/V slices
+    std::vector<Tensor> pmb_proj_k(cfg.anchor_layers);
+    std::vector<Tensor> pmb_proj_v(cfg.anchor_layers);
+    for (int32_t a = 0; a < cfg.anchor_layers; a++) {
+        auto pk = arena.alloc_tensor(TensorShape(n_pmb, cfg.n_kv_heads, cfg.head_dim));
+        auto pv = arena.alloc_tensor(TensorShape(n_pmb, cfg.n_kv_heads, cfg.head_dim));
+
+        const float* Wqkv = fp16_wire(
+            weights.anchor_layers[a].W_qkv.data,
+            weights.anchor_layers[a].W_qkv_fp16,
+            weights.anchor_layers[a].use_fp16,
+            arena, (size_t)(cfg.q_dim + 2 * kv_dim) * cfg.d_model
+        );
+        const float* Wk = Wqkv + cfg.q_dim * cfg.d_model;
+        const float* Wv = Wk + kv_dim * cfg.d_model;
+
+        for (int32_t s = 0; s < n_pmb; s++) {
+            for (int32_t i = 0; i < kv_dim; i++) {
+                float sum_k = 0.0f, sum_v = 0.0f;
+                for (int32_t j = 0; j < cfg.d_model; j++) {
+                    float r = pmb_raw.data[s * cfg.d_model + j];
+                    sum_k += Wk[i * cfg.d_model + j] * r;
+                    sum_v += Wv[i * cfg.d_model + j] * r;
+                }
+                pk.data[s * kv_dim + i] = sum_k;
+                pv.data[s * kv_dim + i] = sum_v;
+            }
+        }
+        pmb_proj_k[a] = std::move(pk);
+        pmb_proj_v[a] = std::move(pv);
     }
 
     // ─── Store hidden state in an arena tensor ───
@@ -555,10 +615,11 @@ void continuum_forward(
                           state.window_v_caches[anchor_idx],
                           x, state.window_k_caches[anchor_idx],
                           state.window_v_caches[anchor_idx],
-                          state.pmb_slots,
+                          pmb_proj_k[anchor_idx],  // ⚡ Projected PMB K!
+                          pmb_proj_v[anchor_idx],  // ⚡ Projected PMB V!
                           weights.anchor_layers[anchor_idx],
-                          weights.anchor_layers[anchor_idx].static_k,  // ⚡ Projected K!
-                          weights.anchor_layers[anchor_idx].static_v,  // ⚡ Projected V!
+                          weights.anchor_layers[anchor_idx].static_k,
+                          weights.anchor_layers[anchor_idx].static_v,
                           false, arena);
             anchor_idx++;
         } else {
@@ -587,10 +648,11 @@ void continuum_forward(
                           state.window_v_caches[anchor_idx],
                           x, state.window_k_caches[anchor_idx],
                           state.window_v_caches[anchor_idx],
-                          state.pmb_slots,
+                          pmb_proj_k[anchor_idx],  // ⚡ Projected PMB K!
+                          pmb_proj_v[anchor_idx],  // ⚡ Projected PMB V!
                           weights.anchor_layers[anchor_idx],
-                          weights.anchor_layers[anchor_idx].static_k,  // ⚡ Projected K!
-                          weights.anchor_layers[anchor_idx].static_v,  // ⚡ Projected V!
+                          weights.anchor_layers[anchor_idx].static_k,
+                          weights.anchor_layers[anchor_idx].static_v,
                           false, arena);
             anchor_idx++;
         } else {
@@ -619,10 +681,11 @@ void continuum_forward(
                           state.window_v_caches[anchor_idx],
                           x, state.window_k_caches[anchor_idx],
                           state.window_v_caches[anchor_idx],
-                          state.pmb_slots,
+                          pmb_proj_k[anchor_idx],  // ⚡ Projected PMB K!
+                          pmb_proj_v[anchor_idx],  // ⚡ Projected PMB V!
                           weights.anchor_layers[anchor_idx],
-                          weights.anchor_layers[anchor_idx].static_k,  // ⚡ Projected K!
-                          weights.anchor_layers[anchor_idx].static_v,  // ⚡ Projected V!
+                          weights.anchor_layers[anchor_idx].static_k,
+                          weights.anchor_layers[anchor_idx].static_v,
                           false, arena);
             anchor_idx++;
         } else {
