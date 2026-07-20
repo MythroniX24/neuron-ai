@@ -23,6 +23,8 @@ SOURCES  := $(wildcard $(SRCDIR)/*.cpp)
 OBJECTS  := $(patsubst $(SRCDIR)/%.cpp,$(BUILDDIR)/%.o,$(SOURCES))
 TARGET   := $(BUILDDIR)/continuum
 
+all: $(TARGET)
+
 # Android NDK cross-compile target
 android-arm64:
 	$(MAKE) CXX=aarch64-linux-android21-clang++ \
@@ -33,8 +35,6 @@ android-arm64:
 # Portable build (no -march=native, runs on any ARM CPU)
 portable:
 	$(MAKE) CXXFLAGS="-std=c++17 -O2 -ffast-math -Wall" all
-
-all: $(TARGET)
 
 $(TARGET): $(OBJECTS) | $(BUILDDIR)
 	$(CXX) $(OBJECTS) -o $@ $(LDFLAGS)
