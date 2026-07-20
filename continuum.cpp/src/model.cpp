@@ -442,7 +442,7 @@ void pmb_write(const Tensor& chunk_summary, PMBWeights& w, Arena& arena) {
 //
 // Called once per forward pass (not per token!) — result cached in AnchorWeights.static_k/v
 // ============================================================================
-void project_static_anchors(AnchorWeights& w, const ModelConfig& cfg, Arena& arena) {
+void project_static_anchors(const AnchorWeights& w, const ModelConfig& cfg, Arena& arena) {
     int32_t n_static = cfg.n_static_anchors;
     int32_t kv_dim = cfg.kv_dim;
     int32_t d_model = cfg.d_model;
@@ -483,7 +483,6 @@ void project_static_anchors(AnchorWeights& w, const ModelConfig& cfg, Arena& are
         }
     }
 
-    w.static_kv_dirty = false;
 }
 
 // ============================================================================
@@ -533,12 +532,9 @@ void continuum_forward(
     // projects raw static_anchors through W_qkv's K and V weight slices.
     // Done ONCE per forward pass because arena memory is ephemeral:
     // projected tensors point into arena memory which is freed between calls.
-    // static_k/static_v are `mutable` — no const_cast needed.
+    // static_k/static_v are `mutable` — writable through const ref, no const_cast needed.
     for (int32_t a = 0; a < cfg.anchor_layers; a++) {
-        project_static_anchors(
-            const_cast<AnchorWeights&>(weights.anchor_layers[a]),
-            cfg, arena
-        );
+        project_static_anchors(weights.anchor_layers[a], cfg, arena);
     }
 
     // ─── Store hidden state in an arena tensor ───

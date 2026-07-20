@@ -218,7 +218,7 @@ inline const float* fp16_wire(const float* fp32, const HalfStorage& hs,
 
 // Static anchor projection: projects static_anchors through W_qkv K/V weight slices
 // Equivalent to Python's AnchorAttention.refresh_static_cache()
-void project_static_anchors(AnchorWeights& w, const ModelConfig& cfg, Arena& arena);
+void project_static_anchors(const AnchorWeights& w, const ModelConfig& cfg, Arena& arena);
 
 // GLT forward: x[d_model] + state[d_state,d_state] → output[d_model] + new_state
 void glt_forward(Tensor& output, Tensor& new_state,
