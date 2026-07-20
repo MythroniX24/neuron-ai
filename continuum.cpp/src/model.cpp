@@ -445,12 +445,75 @@ void pmb_read(Tensor& readouts, const Tensor& query, const PMBWeights& w, Arena&
 }
 
 // ============================================================================
-// PMB write: chunk_summary → update slots (placeholder)
+// PMB write: chunk_summary[d_model] → update all 64 slots via gated update.
+//
+// Python equivalent: PersistentMemoryBank.write(chunk_summary):
+//   similarity = write_scale * (chunk_summary @ slots^T)  → [n_slots]
+//   addressing = softmax(similarity)                       → [n_slots]
+//   gate = sigmoid(W_update([slot, chunk_summary]))        → [n_slots]
+//   effective = addressing * gate                          → [n_slots]
+//   new_slot = (1-effective) * old_slot + effective * chunk_summary
+//
+// Simplification vs Python: batch=1 always (no mean across batch)
 // ============================================================================
 void pmb_write(const Tensor& chunk_summary, PMBWeights& w, Arena& arena) {
-    (void)chunk_summary;
-    (void)w;
-    (void)arena;
+    int32_t n_slots = w.slots.shape.ne[0];
+    int32_t d_model = w.slots.shape.ne[1];
+
+    // 1. Similarity scores: score[s] = write_scale * (summary · slots[s])
+    auto similarity = arena.alloc_tensor(TensorShape(n_slots));
+    for (int32_t s = 0; s < n_slots; s++) {
+        float sim = 0.0f;
+        for (int32_t d = 0; d < d_model; d++) {
+            sim += w.slots.data[s * d_model + d] * chunk_summary.data[d];
+        }
+        similarity.data[s] = sim * w.write_scale;
+    }
+
+    // 2. Softmax addressing
+    float max_sim = similarity.data[0];
+    for (int32_t s = 1; s < n_slots; s++) {
+        if (similarity.data[s] > max_sim) max_sim = similarity.data[s];
+    }
+    float sum_exp = 0.0f;
+    for (int32_t s = 0; s < n_slots; s++) {
+        float e = std::exp(similarity.data[s] - max_sim);
+        similarity.data[s] = e;
+        sum_exp += e;
+    }
+    float inv_sum = 1.0f / (sum_exp + 1e-10f);
+    for (int32_t s = 0; s < n_slots; s++) {
+        similarity.data[s] *= inv_sum;  // now = softmax output
+    }
+
+    // 3. Update gate for each slot: sigmoid(W_update([slot, chunk_summary]))
+    // W_update shape: [1, 2*d_model] — a single row producing one scalar per slot
+    // For each slot: gate_input = concat(slot[s], chunk_summary) → [2*d_model]
+    //              → sum(W_update[0, i] * gate_input[i]) + bias → sigmoid
+    auto gates = arena.alloc_tensor(TensorShape(n_slots));
+    for (int32_t s = 0; s < n_slots; s++) {
+        float g = w.update_bias.data[0];
+        // First half: slot content
+        for (int32_t d = 0; d < d_model; d++) {
+            g += w.W_update.data[d] * w.slots.data[s * d_model + d];
+        }
+        // Second half: chunk summary
+        for (int32_t d = 0; d < d_model; d++) {
+            g += w.W_update.data[d_model + d] * chunk_summary.data[d];
+        }
+        gates.data[s] = 1.0f / (1.0f + std::exp(-g));
+    }
+
+    // 4. Effective update = addressing * gate
+    // 5. New slot = (1 - effective) * old + effective * chunk_summary
+    for (int32_t s = 0; s < n_slots; s++) {
+        float eff = similarity.data[s] * gates.data[s];
+        float retain = 1.0f - eff;
+        for (int32_t d = 0; d < d_model; d++) {
+            w.slots.data[s * d_model + d] =
+                retain * w.slots.data[s * d_model + d] + eff * chunk_summary.data[d];
+        }
+    }
 }
 
 // ============================================================================
@@ -537,6 +600,7 @@ void RuntimeState::reset() {
     for (auto& w : window_k_caches) w.fill(0.0f);
     for (auto& w : window_v_caches) w.fill(0.0f);
     pmb_slots.fill(0.0f);
+    token_counter = 0;
 }
 
 // ============================================================================
@@ -777,6 +841,16 @@ void continuum_forward(
     auto xn = arena.alloc_tensor(TensorShape(cfg.d_model));
     rms_norm_forward(xn, x, weights.embed.final_norm_scale, 1e-6f);
     output_projection(logits, xn, weights.embed, arena);
+
+    // ⚡ PMB write: update memory bank every chunk_size tokens.
+    // Uses the hidden state `x` (before final norm + output projection) as
+    // the chunk summary — represents what the model learned from this token.
+    // The token counter persists across calls (not arena-reset).
+    state.token_counter++;
+    if (state.token_counter % cfg.chunk_size == 0) {
+        // x is still valid here (xn and logits are separate allocations)
+        pmb_write(x, const_cast<PMBWeights&>(weights.pmb), arena);
+    }
 }
 
 // ============================================================================

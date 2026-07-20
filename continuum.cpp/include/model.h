@@ -196,6 +196,9 @@ struct RuntimeState {
     // PMB slots
     Tensor pmb_slots;
 
+    // ⚡ Token counter for PMB write scheduling (write every chunk_size tokens)
+    int32_t token_counter = 0;
+
     void init(const ModelConfig& cfg, Arena& arena);
     void reset();
 };
