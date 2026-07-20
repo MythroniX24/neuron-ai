@@ -22,6 +22,40 @@
 namespace continuum {
 
 // ============================================================================
+// FP16 Half-Precision Utilities (Phase 8)
+// ============================================================================
+
+// IEEE 754 half-precision ↔ single-precision conversion
+float fp16_to_fp32(uint16_t h);
+uint16_t fp32_to_fp16(float f);
+
+// HalfStorage: FP16 weight container for reduced memory bandwidth
+// Weights are stored as uint16_t (half the size of float).
+// Dequantization creates an FP32 copy in the arena for one forward pass.
+struct HalfStorage {
+    uint16_t* data = nullptr;
+    size_t count = 0;
+
+    ~HalfStorage() { if (data) free(data); }
+    HalfStorage() = default;
+    HalfStorage(const HalfStorage&) = delete;
+    HalfStorage& operator=(const HalfStorage&) = delete;
+    HalfStorage(HalfStorage&& o) noexcept : data(o.data), count(o.count) { o.data = nullptr; o.count = 0; }
+    HalfStorage& operator=(HalfStorage&& o) noexcept {
+        if (this != &o) { if (data) free(data); data = o.data; count = o.count; o.data = nullptr; o.count = 0; }
+        return *this;
+    }
+
+    // Create from FP32 data
+    static HalfStorage from_fp32(const float* fp32_data, size_t n);
+
+    // Dequantize into FP32 buffer (must be pre-allocated with count floats)
+    void dequantize(float* fp32_out) const;
+
+    bool empty() const { return data == nullptr || count == 0; }
+};
+
+// ============================================================================
 // Tensor shape: up to 4 dimensions
 // ============================================================================
 struct TensorShape {

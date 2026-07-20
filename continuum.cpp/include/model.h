@@ -92,6 +92,11 @@ struct GLTWeights {
     Tensor W_o;        // [d_model, d_state]
     Tensor norm_scale; // [d_model]
     Tensor kv_norm_scale; // [d_state]
+
+    // ⚡ Phase 8: FP16 weight storage (halves memory bandwidth on phone)
+    bool use_fp16 = false;
+    HalfStorage W_k_fp16, W_v_fp16, W_q_fp16, W_gamma_fp16;
+    HalfStorage W_iota_fp16, W_r_fp16, W_o_fp16;
 };
 
 // ============================================================================
@@ -103,6 +108,10 @@ struct AnchorWeights {
     Tensor static_anchors; // [n_static_anchors, d_model]
     Tensor alibi_slopes;   // [n_heads]
     Tensor norm_scale;     // [d_model]
+
+    // ⚡ Phase 8: FP16 weight storage
+    bool use_fp16 = false;
+    HalfStorage W_qkv_fp16, W_o_fp16;
 };
 
 // ============================================================================
@@ -115,6 +124,10 @@ struct FFNWeights {
     Tensor gate_head;        // [n_shards, d_model]
     Tensor gate_head_bias;   // [n_shards]
     Tensor norm_scale;       // [d_model]
+
+    // ⚡ Phase 8: FP16 weight storage
+    bool use_fp16 = false;
+    HalfStorage gate_proj_fp16, up_proj_fp16, down_proj_fp16, gate_head_fp16;
 };
 
 // ============================================================================
@@ -125,6 +138,10 @@ struct EmbedWeights {
     Tensor up_proj;       // [d_model, d_embed]
     Tensor down_proj;     // [d_embed, d_model]
     Tensor final_norm_scale; // [d_model]
+
+    // ⚡ Phase 8: FP16 weight storage
+    bool use_fp16 = false;
+    HalfStorage embed_table_fp16, up_proj_fp16, down_proj_fp16;
 };
 
 // ============================================================================
