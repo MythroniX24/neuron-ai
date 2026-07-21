@@ -76,6 +76,11 @@ class AnchorAttention(nn.Module):
         self.kv_dim = kv_dim
         self.W_qkv = nn.Linear(d_model, q_dim + 2 * kv_dim, bias=False)
 
+        # ⚡ Phase 10: Pre-fused KV weight — single matmul for window K/V (eliminates torch.cat in hot path)
+        # Uses version-based lazy refresh: only rebuilt when W_qkv.weight is modified (optimizer step).
+        self._fused_kv_weight = None
+        self._fused_kv_version = -1
+
         # Output projection
         self.W_o = nn.Linear(n_heads * self.head_dim, d_model, bias=False)
 
@@ -110,34 +115,46 @@ class AnchorAttention(nn.Module):
         self._cached_static_k = None
         self._cached_static_v = None
 
+    def _get_fused_kv_weight(self):
+        """Return pre-concatenated K+V weight, refreshing only when W_qkv was modified.
+        
+        Uses _version (PyTorch's inplace mutation counter) to detect optimizer updates.
+        Rebuilds via torch.cat only when stale — eliminates per-forward torch.cat overhead.
+        """
+        ver = self.W_qkv.weight._version
+        if self._fused_kv_weight is None or self._fused_kv_version != ver:
+            # ⚡ Keep autograd tracking (NO .data!) — gradients must flow through window cache
+            w = self.W_qkv.weight
+            self._fused_kv_weight = torch.cat([
+                w[self.q_dim:self.q_dim + self.kv_dim],
+                w[self.q_dim + self.kv_dim:self.q_dim + 2 * self.kv_dim]
+            ], dim=0)
+            self._fused_kv_version = ver
+        return self._fused_kv_weight
+
     def _get_kv_weights(self):
         """Extract K and V weight matrices from fused W_qkv.
         
-        Handles regular nn.Linear, QuantizedLinear (INT8), and QuantizedLinearINT4.
-        For quantized layers, dequantizes weights back to float on-the-fly.
-        Uses a cached format flag to avoid hasattr checks in the hot path.
+        Returns K and V weights separately for compatibility with PMB projection path.
+        Uses _get_fused_kv_weight() internally — splits result back to K/V slices.
         """
         fmt = getattr(self, "_w_qkv_format", "linear")
         if fmt == "int8":
             weight = self.W_qkv.weight_int8.float() * self.W_qkv.scale.float()
+            return (
+                weight[self.q_dim:self.q_dim + self.kv_dim],
+                weight[self.q_dim + self.kv_dim:self.q_dim + 2 * self.kv_dim],
+            )
         elif fmt in ("int4", "quantized"):
             weight = self.W_qkv._dequantize()
+            return (
+                weight[self.q_dim:self.q_dim + self.kv_dim],
+                weight[self.q_dim + self.kv_dim:self.q_dim + 2 * self.kv_dim],
+            )
         else:
-            # Default: regular nn.Linear. If a quantizer forgot to update the flag,
-            # fall back gracefully to the first available weight representation.
-            try:
-                weight = self.W_qkv.weight
-            except AttributeError:
-                if hasattr(self.W_qkv, "weight_int8"):
-                    weight = self.W_qkv.weight_int8.float() * self.W_qkv.scale.float()
-                elif hasattr(self.W_qkv, "_dequantize"):
-                    weight = self.W_qkv._dequantize()
-                else:
-                    raise AttributeError(f"W_qkv has no recognized weight format: {type(self.W_qkv)}")
-        return (
-            weight[self.q_dim:self.q_dim + self.kv_dim],
-            weight[self.q_dim + self.kv_dim:self.q_dim + 2 * self.kv_dim],
-        )
+            # ⚡ Phase 10: Use version-checked fused KV weight, then split
+            fused = self._get_fused_kv_weight()
+            return fused[:self.kv_dim], fused[self.kv_dim:]
 
     def refresh_static_cache(self):
         """Precompute static anchor K/V once per forward pass (not per token)."""

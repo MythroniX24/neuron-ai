@@ -589,11 +589,9 @@ class ContinuumModel(nn.Module):
                 # Take up to ws last tokens (may be fewer if L < ws)
                 last_x = block.mixer.norm(x[:, -ws:, :])  # [B, min(L, ws), d_model]
                 actual_ws = last_x.shape[1]
-                # ⚡ Fused K/V: single matmul for both K and V projections
-                # Uses _get_kv_weights() to support quantized weights (INT8/INT4)
-                # 1 fused matmul instead of 2 separate = -50% kernel launch overhead
-                W_k_w, W_v_w = block.mixer._get_kv_weights()
-                kv_all = F.linear(last_x, torch.cat([W_k_w, W_v_w], dim=0))  # [B, actual_ws, 2*kv_dim]
+                # ⚡ Phase 10: Direct fused KV matmul (no torch.cat! Uses pre-concatenated weight)
+                # Uses _get_fused_kv_weight() with version-based lazy refresh
+                kv_all = F.linear(last_x, block.mixer._get_fused_kv_weight())  # [B, actual_ws, 2*kv_dim]
                 new_wk_flat, new_wv_flat = kv_all.split(
                     [block.mixer.kv_dim, block.mixer.kv_dim], dim=-1
                 )

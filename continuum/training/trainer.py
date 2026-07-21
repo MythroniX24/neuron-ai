@@ -448,9 +448,11 @@ class ContinuumTrainer:
             else:
                 seq_len = seq_len_end
 
-            # ⚡ Phase 5: Only GC at epoch start (not both start AND end)
+                # ⚡ Phase 5: Only GC at epoch start (not both start AND end)
             if self.device == "cuda":
                 torch.cuda.empty_cache()
+                # ⚡ Also empty CUDA caching allocator to prevent fragmentation over long runs
+                torch.cuda.synchronize()
 
             pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} (L={seq_len})")
             for batch_idx, batch in enumerate(pbar):
@@ -481,6 +483,12 @@ class ContinuumTrainer:
             # Validation
             val_metrics = self.validate(val_loader)
             val_loss = val_metrics["val_loss"]
+
+            # ⚡ FIX: Actually populate history (was never being appended to!)
+            self._history_train_losses.append(avg_loss)
+            self._history_val_losses.append(val_loss)
+            self._history_val_ppls.append(val_metrics["val_ppl"])
+            self._history_epochs.append(epoch + 1)
 
             print(f"Epoch {epoch+1}: loss={avg_loss:.4f}, val_loss={val_loss:.4f}, "
                   f"val_ppl={val_metrics['val_ppl']:.1f}, "
