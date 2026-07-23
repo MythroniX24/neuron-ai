@@ -300,9 +300,10 @@ class ContinuumTrainer:
                 self.scaler.update()
             else:
                 self.optimizer.step()
-
-            if self.scheduler is not None:
-                self.scheduler.step()
+            # ⚡ NOTE: scheduler.step() is called at the TOP of this block (in the
+            # warmup/cosine section). Do NOT call it again here — double-stepping
+            # the scheduler caused cosine decay to complete 2x too fast, hurting
+            # model quality. This was a CRITICAL bug.
 
         # ⚡ FIX: Anneal on optimizer steps with correct total_steps
         # Before: called every micro-step with hardcoded 100000 → wrong schedule
@@ -399,8 +400,10 @@ class ContinuumTrainer:
                     ignore_index=-100,
                 )
 
-            total_loss += ce.item()
-            total_ce += ce.item()
+            # ⚡ OPTIMIZE: Call .item() once (was called twice for same tensor!)
+            ce_val = ce.item()
+            total_loss += ce_val
+            total_ce += ce_val
             total_loops += result["n_loops"]
             n_batches += 1
 

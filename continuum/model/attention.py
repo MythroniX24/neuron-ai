@@ -278,10 +278,16 @@ class AnchorAttention(nn.Module):
             static_v = static_v.view(self.n_static_anchors, self.n_kv_heads, self.head_dim).unsqueeze(0).expand(B, -1, -1, -1)
 
         # PMB readouts: project through K/V weights
+        # ⚡ OPTIMIZE: Use fused KV weight directly (single matmul) instead of separate K/V matmuls.
+        # Before: _get_kv_weights() called (returns K, V separately) → 2 separate F.linear calls.
+        # After: _get_fused_kv_weight() called once → 1 F.linear call → split result.
+        # Saves 1 matmul per anchor forward (significant at 102M params × 3 anchor layers).
         if pmb_readouts is not None:
-            W_k_w, W_v_w = self._get_kv_weights()
-            pmb_k = F.linear(pmb_readouts, W_k_w).view(B, self.n_pmb_anchors, self.n_kv_heads, self.head_dim)
-            pmb_v = F.linear(pmb_readouts, W_v_w).view(B, self.n_pmb_anchors, self.n_kv_heads, self.head_dim)
+            fused_w = self._get_fused_kv_weight()  # [2*kv_dim, d_model]
+            pmb_kv = F.linear(pmb_readouts, fused_w)  # [B, n_pmb_anchors, 2*kv_dim]
+            pmb_k, pmb_v = pmb_kv.split([self.kv_dim, self.kv_dim], dim=-1)
+            pmb_k = pmb_k.view(B, self.n_pmb_anchors, self.n_kv_heads, self.head_dim)
+            pmb_v = pmb_v.view(B, self.n_pmb_anchors, self.n_kv_heads, self.head_dim)
             all_k = torch.cat([static_k, pmb_k, window_k], dim=1)
             all_v = torch.cat([static_v, pmb_v, window_v], dim=1)
         else:
@@ -327,18 +333,28 @@ class AnchorAttention(nn.Module):
             all_k = self._repeat_kv_for_gqa(all_k)
             all_v = self._repeat_kv_for_gqa(all_v)
 
+            # ⚡ OPTIMIZE: Build attention mask with minimal allocations.
+            # Before: 4 separate tensor allocations (anchor_bias, full_bias, causal_float, ones).
+            # After: 1 pre-allocated tensor + 1 triu call. Saves 2-3 allocs per anchor forward.
+            ws_len = total_kv_len - anchor_count
+
             # ALiBi bias: zeros for anchors + learned slopes for window
-            anchor_bias = torch.zeros(1, 1, self.n_heads, anchor_count, device=x.device, dtype=q.dtype)
-            full_bias = torch.cat([anchor_bias, self.alibi_bias_full.to(device=x.device, dtype=q.dtype)], dim=-1)
-            alibi_attn_mask = full_bias.view(1, self.n_heads, 1, total_kv_len)
+            # Shape: [1, n_heads, 1, total_kv_len] — broadcasts with Q@K^T [B, n_heads, L, T]
+            alibi_attn_mask = torch.zeros(1, self.n_heads, 1, total_kv_len, device=x.device, dtype=q.dtype)
+            if ws_len > 0:
+                alibi_attn_mask[:, :, :, anchor_count:] = \
+                    self.alibi_bias_full.to(device=x.device, dtype=q.dtype)[:, :, :, :ws_len]
 
             if causal_mask and L > 1:
-                causal_float = torch.zeros(L, total_kv_len, device=x.device, dtype=q.dtype)
-                causal_float[:, anchor_count:] = torch.triu(
-                    torch.ones(L, self.window_size, device=x.device, dtype=q.dtype) * float('-inf'),
-                    diagonal=1
-                )
-                alibi_attn_mask = alibi_attn_mask + causal_float
+                # Add causal mask: -inf for window positions where kv_pos >= q_pos
+                # Shape: [L, total_kv_len] — broadcasts with alibi_attn_mask
+                causal_mask_tensor = torch.zeros(L, total_kv_len, device=x.device, dtype=q.dtype)
+                if ws_len > 0:
+                    causal_mask_tensor[:, anchor_count:] = torch.triu(
+                        torch.full((L, ws_len), float('-inf'), device=x.device, dtype=q.dtype),
+                        diagonal=1
+                    )
+                alibi_attn_mask = alibi_attn_mask + causal_mask_tensor.unsqueeze(0)
 
             output = F.scaled_dot_product_attention(
                 q.transpose(1, 2),
@@ -388,6 +404,8 @@ class AnchorAttention(nn.Module):
         new_v = v_flat.view(B, 1, self.n_kv_heads, self.head_dim)
 
         # Shift window left, append new token
+        # Note: torch.roll + in-place was tried but causes autograd version issues
+        # in sequential forward path. torch.cat is safe — creates fresh tensor.
         new_window_k = torch.cat([window_k[:, 1:, :, :], new_k], dim=1)
         new_window_v = torch.cat([window_v[:, 1:, :, :], new_v], dim=1)
 
