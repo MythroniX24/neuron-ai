@@ -407,17 +407,21 @@ class ConversationalDataset:
         
         class _Dataset(Dataset):
             def __init__(self, samples):
-                self.samples = samples
+                # ⚡ OPTIMIZE: Pre-convert all samples to tensors at init time.
+                # Before: torch.tensor() called per-item per-epoch (5850× per epoch).
+                # Each torch.tensor() allocates a new tensor from a Python list — slow.
+                # After: One-time conversion at dataset creation, reused every epoch.
+                self.samples = [
+                    (torch.tensor(s[0], dtype=torch.long),
+                     torch.tensor(s[1], dtype=torch.long))
+                    for s in samples
+                ]
             
             def __len__(self):
                 return len(self.samples)
             
             def __getitem__(self, idx):
-                input_ids, labels = self.samples[idx]
-                return (
-                    torch.tensor(input_ids, dtype=torch.long),
-                    torch.tensor(labels, dtype=torch.long),
-                )
+                return self.samples[idx]
         
         def collate_fn(batch):
             input_ids = [item[0] for item in batch]
@@ -495,19 +499,19 @@ class ConversationalDataset:
         
         class BucketDataset(Dataset):
             def __init__(self, samples, indices):
-                self.samples = samples
-                self.indices = indices
+                # ⚡ OPTIMIZE: Pre-convert indexed samples to tensors at init.
+                # Same optimization as _Dataset above — avoids per-item torch.tensor().
+                self.samples = [
+                    (torch.tensor(samples[i][0], dtype=torch.long),
+                     torch.tensor(samples[i][1], dtype=torch.long))
+                    for i in indices
+                ]
             
             def __len__(self):
-                return len(self.indices)
+                return len(self.samples)
             
             def __getitem__(self, idx):
-                real_idx = self.indices[idx]
-                input_ids, labels = self.samples[real_idx]
-                return (
-                    torch.tensor(input_ids, dtype=torch.long),
-                    torch.tensor(labels, dtype=torch.long),
-                )
+                return self.samples[idx]
         
         def collate_fn(batch):
             input_ids = [item[0] for item in batch]
