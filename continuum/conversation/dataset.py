@@ -560,7 +560,14 @@ class ConversationalDataset:
                         yield batch
             
             def __len__(self):
-                return len(self.indices) // self.batch_size
+                # ⚡ FIX: Only count batches that will actually be yielded (== batch_size)
+                # Before: len // batch_size overcounted when last chunk < batch_size
+                # This made tqdm progress bar show wrong total → confusing ETA
+                full_batches = 0
+                for i in range(0, len(self.indices), self.batch_size):
+                    if i + self.batch_size <= len(self.indices):
+                        full_batches += 1
+                return full_batches
         
         batch_sampler = BucketBatchSampler(
             list(range(len(active_samples))),

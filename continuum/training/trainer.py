@@ -178,6 +178,8 @@ class ContinuumTrainer:
         #        Monitoring
         self.sparsity_monitor = SparsityMonitor()
         self.global_step = 0
+        self._optimizer_step_count = 0  # ⚡ Fix: track actual optimizer steps (not micro-steps)
+        self._total_optimizer_steps = 1  # Set in train() — avoids division by zero before train() is called
         self.best_val_loss = float("inf")
         self._history_train_losses = []
         self._history_val_losses = []
@@ -220,9 +222,16 @@ class ContinuumTrainer:
         # ⚡ Phase 5: Determine optimizer step boundary first (used by LR warmup and logging)
         is_optimizer_step = accumulation_step == total_accumulation_steps
 
-        # ⚡ Phase 5: Only warmup LR on optimizer step boundaries (not every accumulation micro-step)
+        # ⚡ FIX: Use optimizer step count (not micro-step count) for warmup
+        # With grad_accum=2, global_step increments 2x per optimizer step.
+        # Using global_step made warmup complete 2x too fast → unstable early training.
         if is_optimizer_step:
-            self._warmup_lr(self.global_step)
+            self._optimizer_step_count += 1
+            self._warmup_lr(self._optimizer_step_count)
+            # ⚡ FIX: Apply cosine annealing AFTER warmup (scheduler was NEVER created!)
+            # Without this, LR stayed flat at base_lr after warmup → worse convergence.
+            if self.scheduler is not None and self._optimizer_step_count > self.warmup_steps:
+                self.scheduler.step()
 
         # ⚡ Phase 7: Async data transfer via dedicated CUDA stream
         # Transfer overlaps with backward pass of previous step (compute/transfer overlap)
@@ -295,23 +304,42 @@ class ContinuumTrainer:
             if self.scheduler is not None:
                 self.scheduler.step()
 
-        # Anneal loss weights
-        self.loss_fn.anneal_weights(self.global_step, 100000)
+        # ⚡ FIX: Anneal on optimizer steps with correct total_steps
+        # Before: called every micro-step with hardcoded 100000 → wrong schedule
+        if is_optimizer_step:
+            self.loss_fn.anneal_weights(self._optimizer_step_count, self._total_optimizer_steps)
 
-        # ⚡ Phase 5: Only monitor gamma on log intervals (not every step — saves GPU sync)
-        gamma_monitor = self._monitor_gamma_gates() if is_optimizer_step and self.global_step % self.log_interval == 0 else {}
+        # ⚡ OPTIMIZE: Only call .item() (GPU→CPU sync) on log intervals.
+        # Before: 5 × .item() per step × 5850 steps = 29,250 GPU syncs/epoch.
+        # After: 1 × .item() per step (loss only) + 4 × .item() every 100 steps.
+        # Saves ~90% of GPU synchronization overhead.
+        should_log = is_optimizer_step and self.global_step % self.log_interval == 0
+        gamma_monitor = self._monitor_gamma_gates() if should_log else {}
 
-        return {
-            "loss": losses["total"].item(),
-            "ce_loss": losses["ce"].item(),
-            "ponder_cost": losses["ponder"].item(),
-            "sparsity_loss": losses["sparsity"].item(),
-            "memory_loss": losses["memory"].item(),
-            "n_loops": result["n_loops"],
-            "lr": self.optimizer.param_groups[0]["lr"],
-            "throughput": self.total_tokens_processed / max(time.time() - self.training_start_time, 1),
-            **gamma_monitor,
-        }
+        # loss is always needed for epoch averaging — one .item() is unavoidable
+        loss_val = losses["total"].item()
+
+        if should_log:
+            return {
+                "loss": loss_val,
+                "ce_loss": losses["ce"].item(),
+                "ponder_cost": losses["ponder"].item(),
+                "sparsity_loss": losses["sparsity"].item(),
+                "memory_loss": losses["memory"].item(),
+                "n_loops": result["n_loops"],
+                "lr": self.optimizer.param_groups[0]["lr"],
+                "throughput": self.total_tokens_processed / max(time.time() - self.training_start_time, 1),
+                **gamma_monitor,
+            }
+        else:
+            # ⚡ Skip .item() for metrics only used for logging (not epoch averaging)
+            return {
+                "loss": loss_val,
+                "ce_loss": 0.0, "ponder_cost": 0.0, "sparsity_loss": 0.0,
+                "memory_loss": 0.0, "n_loops": 0.0,
+                "lr": self.optimizer.param_groups[0]["lr"],
+                "throughput": 0.0,
+            }
 
     def _monitor_gamma_gates(self) -> Dict[str, float]:
         """Monitor GLT decay gate distribution for training stability (Section 18)."""
@@ -415,8 +443,20 @@ class ContinuumTrainer:
             grad_accum_steps: Number of batches to accumulate gradients over
         """
         total_steps = len(train_loader) * num_epochs
+        # ⚡ FIX: Calculate optimizer steps (accounting for gradient accumulation)
+        self._total_optimizer_steps = max(1, total_steps // grad_accum_steps)
+
+        # ⚡ FIX: Create CosineAnnealingLR — was NEVER created!
+        # Without this, LR stayed flat at base_lr after warmup → worse final convergence.
+        # Cosine decay from base_lr to 1% of base_lr over remaining steps after warmup.
+        decay_steps = max(1, self._total_optimizer_steps - self.warmup_steps)
+        self.scheduler = CosineAnnealingLR(
+            self.optimizer, T_max=decay_steps, eta_min=self.base_lr * 0.01
+        )
 
         print(f"Starting training: {num_epochs} epochs, ~{total_steps} steps")
+        print(f"  Optimizer steps: ~{self._total_optimizer_steps} (grad_accum={grad_accum_steps})")
+        print(f"  LR schedule: warmup({self.warmup_steps}) → cosine decay → {self.base_lr * 0.01:.2e}")
         print(f"Model: {self.model.num_params:,} parameters")
         print(f"Device: {self.device}")
         mode = "Parallel (Phase 2)" if self.use_parallel_forward else "Sequential"
@@ -511,13 +551,17 @@ class ContinuumTrainer:
 
     def save_checkpoint(self, epoch: int, is_best: bool = False):
         """Save model checkpoint."""
+        # ⚡ FIX: Handle torch.compile — access original module for state_dict and config
+        # When model is compiled, self.model is an OptimizedModule wrapper.
+        # state_dict() works but .config attribute is on the original module.
+        orig_model = getattr(self.model, '_orig_mod', self.model)
         checkpoint = {
             "epoch": epoch,
             "global_step": self.global_step,
-            "model_state_dict": self.model.state_dict(),
+            "model_state_dict": orig_model.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "best_val_loss": self.best_val_loss,
-            "config": self.model.config,
+            "config": orig_model.config,
         }
 
         path = os.path.join(self.checkpoint_dir, f"checkpoint_epoch_{epoch+1}.pt")

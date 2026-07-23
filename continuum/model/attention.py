@@ -110,6 +110,12 @@ class AnchorAttention(nn.Module):
 
         self.dropout = nn.Dropout(dropout)
 
+        # ⚡ OPTIMIZE: Cache compiled FlexAttention score_mod — was being recreated
+        # on EVERY forward call. Now created once and reused, keyed on (anchor_count, causal_mask)
+        # because anchor_count varies when pmb_readouts is present vs absent.
+        # flex_attention compiles score_mod into a Triton kernel on first call.
+        self._score_mod_cache = {}  # {(anchor_count, causal_mask): score_mod_fn}
+
         # ⚡ Phase 1 optimization: cache static anchor K/V (same for all tokens in a forward pass)
         # Regular attributes (not buffers) — these are transient per-forward-pass caches
         self._cached_static_k = None
@@ -291,8 +297,12 @@ class AnchorAttention(nn.Module):
         #          and the associated CPU-GPU sync points (graph breaks).
         # Falls back to SDPA for single-token inference (L==1) or older PyTorch.
         if self._flex_available and L > 1:
-            # FlexAttention natively supports GQA — pass unrepeated K/V (n_kv_heads).
-            score_mod = self._make_flex_score_mod(anchor_count, causal_mask)
+            # ⚡ OPTIMIZE: Use cached score_mod keyed on (anchor_count, causal_mask)
+            # anchor_count differs when pmb_readouts is present vs absent — must key on both.
+            cache_key = (anchor_count, causal_mask)
+            if cache_key not in self._score_mod_cache:
+                self._score_mod_cache[cache_key] = self._make_flex_score_mod(anchor_count, causal_mask)
+            score_mod = self._score_mod_cache[cache_key]
 
             # Try with explicit enable_gqa first (PyTorch 2.6+),
             # fall back to auto-detection (PyTorch 2.5 — detects GQA from head count mismatch)
