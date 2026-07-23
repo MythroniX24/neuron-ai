@@ -275,6 +275,21 @@ class ContinuumTrainer:
         # Gradient accumulation: average loss over accumulation steps
         loss_for_backward = losses["total"] / total_accumulation_steps
 
+        # ⚡ Phase 14: NaN/Inf safety check — CRITICAL for FP16 training stability.
+        # If loss is NaN/Inf, skip this step entirely to prevent weight corruption.
+        # GradScaler.update() will automatically reduce the scale factor, making
+        # future steps more numerically stable. But we must NOT step the optimizer
+        # with NaN gradients — that permanently corrupts all weights.
+        if torch.isinf(loss_for_backward) or torch.isnan(loss_for_backward):
+            # Skip backward + optimizer step — just return a safe loss value
+            if is_optimizer_step and self.scaler is not None:
+                self.scaler.update()  # Reduce scale factor for next step
+            return {
+                "loss": float("nan"), "ce_loss": 0.0, "ponder_cost": 0.0,
+                "sparsity_loss": 0.0, "memory_loss": 0.0, "n_loops": 0.0,
+                "lr": self.optimizer.param_groups[0]["lr"], "throughput": 0.0,
+            }
+
         # ⚡ AMP: Backward with GradScaler (prevents FP16 underflow)
         if self.scaler is not None:
             self.scaler.scale(loss_for_backward).backward()

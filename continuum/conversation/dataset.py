@@ -453,6 +453,7 @@ class ConversationalDataset:
         pin_memory: bool = True,
         prefetch_factor: int = 4,
         use_persistent_workers: bool = True,
+        worker_init_fn = None,
     ):
         """
         ⚡ Phase 1: Bucket sampler — groups same-length sequences to minimize padding waste.
@@ -588,6 +589,7 @@ class ConversationalDataset:
             pin_memory=pin_memory,
             persistent_workers=use_persistent_workers and num_workers > 0,
             prefetch_factor=prefetch_factor if num_workers > 0 else None,
+            worker_init_fn=worker_init_fn,
         )
     
     def get_stats(self) -> Dict:
