@@ -28,6 +28,7 @@
 20. Self-Critique — Known Limitations
 21. Alternative Designs Considered and Rejected
 22. Goal Traceability & Closing Summary
+23. Continuum Vision (ViGLT) — Multimodal Extension
 
 ---
 

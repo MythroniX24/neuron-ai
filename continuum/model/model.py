@@ -18,6 +18,13 @@ from continuum.model.layers import (
 )
 from continuum.model.attention import AnchorAttention, PersistentMemoryBank
 
+# Vision modules (core part of the architecture since Section 23)
+from continuum.model.vision import (
+    ContinuumVisionConfig, ContinuumVisionEncoder,
+    create_vision_encoder_max, create_vision_encoder_small,
+    create_vision_encoder_nano,
+)
+
 
 # ============================================================================
 # Model Configuration
@@ -33,6 +40,9 @@ class ContinuumConfig:
         d_state: int = 48,
         d_embed: int = 48,
         vocab_size: int = 8000,
+
+        # Vision configuration (optional)
+        vision_config: Optional[ContinuumVisionConfig] = None,
 
         # Layer counts and split
         n_layers: int = 6,
@@ -97,6 +107,10 @@ class ContinuumConfig:
 
         self.dropout = dropout
         self.eos_token_id = eos_token_id
+
+        # Vision (optional)
+        self.vision_config = vision_config
+        self.has_vision = vision_config is not None
 
         # Validate
         assert perception_layers + core_layers + output_layers == n_layers
@@ -244,6 +258,13 @@ class ContinuumModel(nn.Module):
 
         # ---- Final norm ----
         self.final_norm = RMSNorm(config.d_model)
+
+        # ---- Vision Encoder (optional) ----
+        self.vision_encoder = None
+        if config.has_vision and config.vision_config is not None:
+            self.vision_encoder = ContinuumVisionEncoder(
+                config.vision_config, config.d_model
+            )
 
         # ---- Count parameters ----
         self._n_params = sum(p.numel() for p in self.parameters())
@@ -721,6 +742,8 @@ class ContinuumModel(nn.Module):
         Reduces Python overhead by 70-80% compared to token-by-token forward.
         Only the Core stage (with ADL halting) processes tokens sequentially.
         
+        Delegates to _forward_from_embeddings to share logic with multimodal path.
+        
         Args:
             token_ids: [B, seq_len] token IDs
             core_max_loops: Max ADL loops for Core stage. Use 1 for training.
@@ -729,42 +752,56 @@ class ContinuumModel(nn.Module):
         Returns:
             Dict with logits, glt_states, window_caches, n_loops, ponder_cost
         """
-        B, seq_len = token_ids.shape
-        device = token_ids.device
-        dtype = self.embedding.embed_table.weight.dtype
-        
+        # Embed tokens, then delegate to shared embeddings→logits pipeline
+        embeddings = self.embedding.embed(token_ids)
+        return self._forward_from_embeddings(embeddings, core_max_loops=core_max_loops)
+
+
+    def _forward_from_embeddings(
+        self,
+        embeddings: torch.Tensor,
+        core_max_loops: Optional[int] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Internal: Run stages starting from pre-computed embeddings.
+        Used by forward_multimodal for vision+text fusion.
+
+        Args:
+            embeddings: [B, total_len, d_model] pre-computed embeddings
+            core_max_loops: Max ADL loops for Core stage (1 for training)
+
+        Returns:
+            Dict with logits, glt_states, window_caches, n_loops, ponder_cost
+        """
+        B, seq_len, _ = embeddings.shape
+        device = embeddings.device
+        dtype = embeddings.dtype
+
         # Initialize states
         glt_states, window_caches = self.init_states(B, str(device), dtype)
-        
+
         # Refresh static anchor caches for all layers
         for block in (list(self.perception_blocks) +
                       list(self.core_blocks) +
                       list(self.output_blocks)):
             if block.is_anchor:
                 block.mixer.refresh_static_cache()
-        
-        # Embed all tokens
-        x = self.embedding.embed(token_ids)  # [B, seq_len, d_model]
-        
-        # Fetch PMB readouts
-        pmb_readouts = self._get_pmb_readouts(x)
-        
+
+        # Get PMB readouts
+        pmb_readouts = self._get_pmb_readouts(embeddings)
+
         # === STAGE 1: Parallel Perception ===
         x, glt_states, window_caches = self._run_stage_parallel(
-            x, self.perception_blocks, glt_states, window_caches,
+            embeddings, self.perception_blocks, glt_states, window_caches,
             pmb_readouts, state_offset=0, window_offset=0
         )
-        
-        # === STAGE 2: Core (fully parallel when ADL disabled, sequential when ADL active) ===
+
+        # === STAGE 2: Core ===
         core_state_start = len(self.perception_blocks)
         core_window_start = sum(1 for b in self.perception_blocks if b.is_anchor)
-        
+
         if core_max_loops is not None and core_max_loops <= 1:
-            # ⚡ TRAINING FAST PATH: Fully parallel Core — no per-token Python loop!
-            # When ADL is disabled (max_loops=1), all tokens through Core in ONE pass.
-            # GLT parallel scan is exact. Anchor window uses Perception's cache
-            # (not Core's refined cache) — causally correct, trains fine from scratch.
-            # Eliminates seq_len×layer_count Python overhead.
+            # Training fast path: fully parallel
             x, glt_states, window_caches = self._run_stage_parallel(
                 x, self.core_blocks, glt_states, window_caches,
                 pmb_readouts, state_offset=core_state_start,
@@ -773,12 +810,11 @@ class ContinuumModel(nn.Module):
             total_loops = 0
             total_ponder = torch.tensor(0.0, device=device)
         else:
-            # Sequential Core (ADL active) — per-token for halting decisions
             total_loops = 0
             total_ponder = torch.tensor(0.0, device=device)
             core_outputs = []
             for t in range(seq_len):
-                xt = x[:, t, :]  # [B, d_model]
+                xt = x[:, t, :]
                 xt, glt_states, window_caches, n_loops, ponder = self._run_stage_core(
                     xt, glt_states, window_caches, pmb_readouts,
                     token_idx=t, max_loops=core_max_loops,
@@ -786,24 +822,24 @@ class ContinuumModel(nn.Module):
                 total_loops += n_loops
                 total_ponder = total_ponder + ponder
                 core_outputs.append(xt)
-            
-            x = torch.stack(core_outputs, dim=1)  # [B, seq_len, d_model]
-        
+
+            x = torch.stack(core_outputs, dim=1)
+
         # === STAGE 3: Parallel Output ===
         output_state_start = len(self.perception_blocks) + len(self.core_blocks)
         output_window_start = core_window_start + sum(1 for b in self.core_blocks if b.is_anchor)
-        
+
         x, glt_states, window_caches = self._run_stage_parallel(
             x, self.output_blocks, glt_states, window_caches,
             pmb_readouts, state_offset=output_state_start, window_offset=output_window_start
         )
-        
+
         # Final norm + output projection
         x = self.final_norm(x)
         logits = self.embedding.project_to_logits(x)
-        
+
         avg_loops = total_loops / max(seq_len, 1)
-        
+
         return {
             "logits": logits,
             "glt_states": glt_states,
@@ -812,6 +848,136 @@ class ContinuumModel(nn.Module):
             "ponder_cost": total_ponder / max(seq_len, 1),
         }
 
+    def forward_multimodal(
+        self,
+        pixel_values: torch.Tensor,
+        token_ids: torch.Tensor,
+        core_max_loops: Optional[int] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Multimodal forward pass — vision + text.
+
+        Encodes the image through the vision encoder, prepends vision tokens
+        to text tokens, then processes everything through the model stages.
+
+        Args:
+            pixel_values: [B, C, H, W] normalized image
+            token_ids: [B, seq_len] text token IDs
+            core_max_loops: Max ADL loops for Core stage (1 for training)
+
+        Returns:
+            Dict with logits, glt_states, window_caches, n_loops, ponder_cost
+        """
+        if self.vision_encoder is None:
+            raise RuntimeError(
+                "Vision encoder not initialized. Create model with vision_config."
+            )
+
+        # 1. Encode vision → [B, N_patches, d_model]
+        vision_tokens = self.vision_encoder(pixel_values)
+
+        # 2. Embed text → [B, L_text, d_model]
+        text_tokens = self.embedding.embed(token_ids)
+
+        # 3. Concatenate: vision first, then text (LLaVA-style)
+        all_embeddings = torch.cat([vision_tokens, text_tokens], dim=1)
+
+        # 4. Process through stages starting from pre-computed embeddings
+        return self._forward_from_embeddings(all_embeddings, core_max_loops=core_max_loops)
+
+    def generate_multimodal(
+        self,
+        pixel_values: torch.Tensor,
+        prompt_ids: torch.Tensor,
+        max_new_tokens: int = 128,
+        temperature: float = 0.8,
+        top_k: int = 40,
+        top_p: float = 0.9,
+    ) -> Tuple[torch.Tensor, List[int]]:
+        """
+        Multimodal autoregressive generation — image + text prompt.
+
+        Encodes the image once, prepends vision embeddings to text,
+        processes the full vision+text prefix, then generates token-by-token.
+
+        Args:
+            pixel_values: [1, C, H, W] single image
+            prompt_ids: [1, prompt_len] text prompt tokens
+            max_new_tokens: Maximum tokens to generate
+            temperature: Sampling temperature
+            top_k: Top-k filtering
+            top_p: Nucleus sampling threshold
+
+        Returns:
+            generated_ids: generated token IDs
+            loop_counts: Per-token ADL loop counts
+        """
+        if self.vision_encoder is None:
+            raise RuntimeError(
+                "Vision encoder not initialized. Create model with vision_config."
+            )
+
+        self.eval()
+        device = pixel_values.device
+        B = pixel_values.shape[0]
+
+        with torch.no_grad():
+            # 1. Encode vision once
+            vision_tokens = self.vision_encoder(pixel_values)  # [1, N, d_model]
+            N_vision = vision_tokens.shape[1]
+
+            # 2. Embed text
+            text_embeddings = self.embedding.embed(prompt_ids)  # [1, L, d_model]
+
+            # 3. Build full prefix embeddings: vision + text
+            prefix_embeddings = torch.cat([vision_tokens, text_embeddings], dim=1)  # [1, N+L, d_model]
+
+            # 4. Run forward on the full prefix to get initial state + logits
+            result = self._forward_from_embeddings(prefix_embeddings, core_max_loops=None)
+            glt_states = result["glt_states"]
+            window_caches = result["window_caches"]
+            next_logits = result["logits"][:, -1, :]  # Last position logits
+
+            # Track generated tokens
+            generated = list(prompt_ids[0].tolist())
+            loop_counts = []
+
+            # 5. Generate token-by-token
+            for _ in range(max_new_tokens):
+                logits = next_logits / temperature
+
+                if top_k > 0:
+                    top_k_vals, _ = torch.topk(logits, min(top_k, logits.shape[-1]))
+                    logits[logits < top_k_vals[:, -1:]] = float("-inf")
+
+                if top_p < 1.0:
+                    sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+                    cumulative_probs = torch.cumsum(
+                        F.softmax(sorted_logits, dim=-1), dim=-1
+                    )
+                    sorted_indices_to_remove = cumulative_probs > top_p
+                    sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
+                    sorted_indices_to_remove[:, 0] = False
+                    indices_to_remove = sorted_indices_to_remove.scatter(
+                        1, sorted_indices, sorted_indices_to_remove
+                    )
+                    logits[indices_to_remove] = float("-inf")
+
+                probs = F.softmax(logits, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
+                generated.append(next_token[0, 0].item())
+
+                if next_token[0, 0].item() == self.config.eos_token_id:
+                    break
+
+                # Forward the new token through the sequential path
+                result = self.forward(next_token, glt_states, window_caches)
+                glt_states = result["glt_states"]
+                window_caches = result["window_caches"]
+                next_logits = result["logits"][:, -1, :]
+                loop_counts.append(result["n_loops"])
+
+        return torch.tensor([generated], device=device), loop_counts
 
     def generate(
         self,
@@ -943,8 +1109,15 @@ class ContinuumModel(nn.Module):
 # Factory function for standard tiers (Section 17)
 # ============================================================================
 
-def create_continuum_nano() -> ContinuumModel:
-    """Create Continuum-Nano: ~5M parameters."""
+def create_continuum_nano(with_vision: bool = False) -> ContinuumModel:
+    """Create Continuum-Nano: ~5M parameters (~7M with vision)."""
+    vision_cfg = ContinuumVisionConfig(
+        image_size=224, patch_size=16,
+        d_vision=128, d_v_state=32,
+        n_bi_glt_layers=2, n_anchor_layers=1,
+        n_heads=4, n_kv_heads=2, spatial_window=25,
+        ffn_expansion=2, ffn_shards=2,
+    ) if with_vision else None
     return ContinuumModel(ContinuumConfig(
         d_model=192, d_state=48, d_embed=48, vocab_size=8000,
         n_layers=6, glt_layers=4, anchor_layers=2,
@@ -954,11 +1127,19 @@ def create_continuum_nano() -> ContinuumModel:
         n_anchors=8, n_static_anchors=4,
         n_max_loops=3, halt_threshold=0.95,
         pmb_slots=16, pmb_readout=4, chunk_size=64,
+        vision_config=vision_cfg,
     ))
 
 
-def create_continuum_small() -> ContinuumModel:
-    """Create Continuum-Small: ~20M parameters."""
+def create_continuum_small(with_vision: bool = False) -> ContinuumModel:
+    """Create Continuum-Small: ~20M parameters (~25M with vision)."""
+    vision_cfg = ContinuumVisionConfig(
+        image_size=224, patch_size=16,
+        d_vision=192, d_v_state=64,
+        n_bi_glt_layers=3, n_anchor_layers=1,
+        n_heads=4, n_kv_heads=2, spatial_window=25,
+        ffn_expansion=3, ffn_shards=2,
+    ) if with_vision else None
     return ContinuumModel(ContinuumConfig(
         d_model=384, d_state=96, d_embed=80, vocab_size=12000,
         n_layers=8, glt_layers=5, anchor_layers=3,
@@ -968,12 +1149,13 @@ def create_continuum_small() -> ContinuumModel:
         n_anchors=12, n_static_anchors=4,
         n_max_loops=4, halt_threshold=0.95,
         pmb_slots=32, pmb_readout=8, chunk_size=64,
+        vision_config=vision_cfg,
     ))
 
 
-def create_continuum_max() -> ContinuumModel:
+def create_continuum_max(with_vision: bool = False) -> ContinuumModel:
     """
-    Create Continuum-Max: ~100M parameters.
+    Create Continuum-Max: ~100M parameters (~115M with vision).
     
     From Section 17 tier table:
     d_model=768, d_state=192, d_embed=160, vocab=16,000
@@ -982,7 +1164,16 @@ def create_continuum_max() -> ContinuumModel:
     Window=128, Anchors=24 (static=8, PMB=16)
     FFN: 4x expansion, 6 shards
     ADL: N_max=5, PMB: 64 slots
+
+    With vision: Adds 13.5M ViGLT encoder (total ~115M)
     """
+    vision_cfg = ContinuumVisionConfig(
+        image_size=224, patch_size=16,
+        d_vision=384, d_v_state=128,
+        n_bi_glt_layers=5, n_anchor_layers=1,
+        n_heads=6, n_kv_heads=3, spatial_window=49,
+        ffn_expansion=3, ffn_shards=3,
+    ) if with_vision else None
     return ContinuumModel(ContinuumConfig(
         d_model=768, d_state=192, d_embed=160, vocab_size=16000,
         n_layers=12, glt_layers=9, anchor_layers=3,
@@ -992,4 +1183,5 @@ def create_continuum_max() -> ContinuumModel:
         n_anchors=24, n_static_anchors=8,
         n_max_loops=5, halt_threshold=0.95,
         pmb_slots=64, pmb_readout=16, chunk_size=64,
+        vision_config=vision_cfg,
     ))

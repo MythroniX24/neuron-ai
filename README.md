@@ -29,6 +29,7 @@
 | **Anchor Attention** | Bounded-size real softmax attention (window + persistent anchors) | Precise recall where recurrence falls short |
 | **Adaptive Depth Looping (ADL)** | Shared-weight reasoning core that loops 1–5× per token | More reasoning depth without more parameters |
 | **Persistent Memory Bank (PMB)** | Fixed-size content-addressable long-term memory | Survives across app sessions (kill & resume) |
+| **🆕 Continuum Vision (ViGLT)** | Bidirectional GLT vision encoder — same primitives | Multimodal: image + text understanding |
 
 **Headline properties:**
 - **No growing KV-cache** — ever. O(1) memory per layer regardless of context length.
@@ -36,6 +37,7 @@
 - **Instant conversation resume** — ~100 KB state checkpoint (not megabytes).
 - **~100 MB INT8 model** — fits comfortably on any modern phone.
 - **Trainable from scratch** on free GPUs (Kaggle T4 ×2 ~1.5 hours for 100M model).
+- **🆕 Multimodal vision** — ~13.5M ViGLT encoder, unified architecture, mobile-friendly.
 
 ---
 
@@ -108,12 +110,12 @@
 
 ## 📊 Model Tiers
 
-| Tier | Params | `d_model` | Layers | Vocab | Vocab Size | Window | FFN Shards | ADL Max |
+| Tier | Params | +Vision | `d_model` | Layers | Vocab | Window | FFN Shards | ADL Max |
 |---|---|---|---|---|---|---|---|---|
-| **Nano** | ~5M | 192 | 6 | 8,000 | 48 | 48 | 2 | 3 |
-| **Small** | ~20M | 384 | 8 | 12,000 | 80 | 96 | 4 | 4 |
-| **Base** | ~50M | 576 | 10 | 16,000 | 128 | 128 | 4 | 4 |
-| **Max** 🏆 | **~100M** | **768** | **12** | **16,000** | **160** | **128** | **6** | **5** |
+| **Nano** | ~5M | ~7M | 192 | 6 | 8,000 | 48 | 2 | 3 |
+| **Small** | ~20M | ~25M | 384 | 8 | 12,000 | 96 | 4 | 4 |
+| **Base** | ~50M | ~58M | 576 | 10 | 16,000 | 128 | 4 | 4 |
+| **Max** 🏆 | **~102M** | **~115M** | **768** | **12** | **16,000** | **128** | **6** | **5** |
 
 All tiers share the same architecture — scale up or down by changing config values. One codebase, any size.
 
@@ -270,7 +272,7 @@ The training pipeline has been aggressively optimized for Kaggle's T4/P100 GPUs:
 
 | Document | Description |
 |---|---|
-| [`continuum-slm-architecture.md`](./continuum-slm-architecture.md) | **Full 22-section architecture document** — design philosophy, every module explained, training strategy, and self-critique |
+| [`continuum-slm-architecture.md`](./continuum-slm-architecture.md) | **Full 23-section architecture document** — design philosophy, every module explained, training strategy, self-critique, and **Section 23: ViGLT Vision** |
 | [Kaggle Notebook](./continuum/kaggle/continuum_100m_training.ipynb) | One-click training notebook — open in Kaggle and Run All |
 | [Colab Notebook](./continuum/colab/continuum_100m_training.ipynb) | Google Colab version (same as Kaggle) |
 
@@ -316,6 +318,40 @@ glt_states, window_caches = model.deserialize_state(state, device="cpu")
 # Continue generation EXACTLY where you left off — no reprocessing!
 ```
 
+### 🆕 Multimodal Vision (NEW!)
+
+```python
+import torch
+from continuum.model.model import create_continuum_max
+
+# Create multimodal model (~115.5M params)
+model = create_continuum_max(with_vision=True)
+model.eval()
+
+# Forward pass: image + text
+image = torch.randn(1, 3, 224, 224)  # Dummy image
+text_ids = torch.randint(0, 16000, (1, 32))  # Text tokens
+
+with torch.no_grad():
+    result = model.forward_multimodal(
+        pixel_values=image,
+        token_ids=text_ids,
+        core_max_loops=1,  # 1 for speed, None for ADL
+    )
+    logits = result["logits"]  # [1, 196+32, vocab_size]
+
+# Autoregressive generation with vision
+# (processes image prefix once, then generates token-by-token)
+generated_ids, loop_counts = model.generate_multimodal(
+    pixel_values=image,
+    prompt_ids=torch.tensor([[1, 2, 3]]),  # Text prompt
+    max_new_tokens=80,
+    temperature=0.8,
+)
+```
+
+**Vision encoder uses the SAME building blocks** as the LLM — GLT, GatedShardFFN, RMSNorm — just adapted for bidirectional spatial processing. See [`continuum-slm-architecture.md#23`](./continuum-slm-architecture.md) for the full design.
+
 ---
 
 ## 🧪 Test Suite
@@ -326,6 +362,17 @@ python -m pytest model/test_model.py -v
 python -m pytest model/test_layers.py -v
 python -m pytest model/test_attention.py -v
 python -m pytest tokenizer/test_tokenizer.py -v
+
+# Vision encoder test
+python3 -c "
+from continuum.model.model import create_continuum_max
+import torch
+model = create_continuum_max(with_vision=True)
+img = torch.randn(1, 3, 224, 224)
+out = model.vision_encoder(img)
+print(f'Vision output: {out.shape}')  # [1, 196, 768]
+print(f'Vision params: {model.vision_encoder.num_params:,}')
+"
 ```
 
 ---
