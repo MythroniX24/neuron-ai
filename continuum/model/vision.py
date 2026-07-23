@@ -583,18 +583,21 @@ class ContinuumVisionEncoder(nn.Module):
 
         # Safety: cap patches for mobile
         if N > config.max_patches:
-            # Downsample by taking every other patch (simple, effective)
-            # This is better than resizing the image because it preserves
-            # the original aspect ratio and fine details
+            # Downsample by taking every step-th patch (simple, effective)
+            # This preserves original aspect ratio better than resizing
             step = math.ceil(N / config.max_patches)
             x = x[:, ::step, :]
             N = x.shape[1]
-            # Adjust grid shape proportionally
-            H_p, W_p = grid_shape
-            if step > 1:
-                H_p = min(H_p, math.ceil(N ** 0.5))
-                W_p = N // H_p
-                grid_shape = (H_p, W_p)
+            # Adjust grid shape: preserve aspect ratio, trim to exact H_p*W_p
+            H_p_orig, W_p_orig = grid_shape
+            ratio = W_p_orig / max(H_p_orig, 1)
+            H_p = max(1, round(math.sqrt(N / ratio)))
+            W_p = N // H_p
+            # Trim patches to exact grid product (lose at most H_p-1 patches)
+            exact_N = H_p * W_p
+            x = x[:, :exact_N, :]
+            N = exact_N
+            grid_shape = (H_p, W_p)
 
         # 2. Apply 2D RoPE
         x = self.rope(x, grid_shape)
