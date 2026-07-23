@@ -6,7 +6,7 @@
 
 CXX      := g++
 CXXFLAGS := -std=c++17 -O2 -march=native -ffast-math -Wall
-LDFLAGS  := -lm
+LDFLAGS  := -lm -lpthread    # ⚡ Phase B: pthread for thread pool
 
 # Try to detect and link BLAS for faster matmul
 BLAS_LIBS := $(shell pkg-config --libs openblas 2>/dev/null || echo "")
@@ -29,7 +29,7 @@ all: $(TARGET)
 android-arm64:
 	$(MAKE) CXX=aarch64-linux-android21-clang++ \
 		CXXFLAGS="-std=c++17 -O3 -march=armv8-a -ffast-math -Wall" \
-		LDFLAGS="-lm -static-libstdc++" \
+		LDFLAGS="-lm -static-libstdc++ -lpthread" \
 		TARGET=$(BUILDDIR)/continuum-arm64
 
 # Portable build (no -march=native, runs on any ARM CPU)
@@ -49,4 +49,4 @@ $(BUILDDIR):
 clean:
 	rm -rf $(BUILDDIR)
 
-.PHONY: all clean android-arm64
+.PHONY: all clean android-arm64 portable

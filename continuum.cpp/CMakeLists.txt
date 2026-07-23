@@ -21,6 +21,8 @@ set(SOURCES
     src/model.cpp
     src/sampler.cpp
     src/continuum.cpp
+    src/threadpool.cpp     # ⚡ Phase B: Thread pool with big-core pinning
+    src/tokenizer.cpp      # ⚡ Phase D: BPE tokenizer in C++
 )
 
 # Headers
@@ -28,6 +30,8 @@ set(HEADERS
     include/tensor.h
     include/model.h
     include/sampler.h
+    include/threadpool.h   # ⚡ Phase B
+    include/tokenizer.h    # ⚡ Phase D
 )
 
 # Executable
@@ -38,6 +42,10 @@ target_include_directories(continuum PRIVATE include)
 if(BLAS_FOUND)
     target_link_libraries(continuum PRIVATE ${BLAS_LIBRARIES})
 endif()
+
+# ⚡ Phase B: Link pthread for thread pool
+find_package(Threads REQUIRED)
+target_link_libraries(continuum PRIVATE Threads::Threads)
 
 # Install
 install(TARGETS continuum DESTINATION bin)

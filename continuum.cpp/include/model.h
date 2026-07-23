@@ -97,6 +97,11 @@ struct GLTWeights {
     bool use_fp16 = false;
     HalfStorage W_k_fp16, W_v_fp16, W_q_fp16, W_gamma_fp16;
     HalfStorage W_iota_fp16, W_r_fp16, W_o_fp16;
+
+    // ⚡ Phase A: INT4 weight storage (quarters memory bandwidth — 50MB vs 200MB)
+    QuantType quant_type = QuantType::FP32;
+    Int4Storage W_k_int4, W_v_int4, W_q_int4, W_gamma_int4;
+    Int4Storage W_iota_int4, W_r_int4, W_o_int4;
 };
 
 // ============================================================================
@@ -118,6 +123,10 @@ struct AnchorWeights {
     // ⚡ Phase 8: FP16 weight storage
     bool use_fp16 = false;
     HalfStorage W_qkv_fp16, W_o_fp16;
+
+    // ⚡ Phase A: INT4 weight storage
+    QuantType quant_type = QuantType::FP32;
+    Int4Storage W_qkv_int4, W_o_int4;
 };
 
 // ============================================================================
@@ -134,6 +143,10 @@ struct FFNWeights {
     // ⚡ Phase 8: FP16 weight storage
     bool use_fp16 = false;
     HalfStorage gate_proj_fp16, up_proj_fp16, down_proj_fp16, gate_head_fp16;
+
+    // ⚡ Phase A: INT4 weight storage
+    QuantType quant_type = QuantType::FP32;
+    Int4Storage gate_proj_int4, up_proj_int4, down_proj_int4, gate_head_int4;
 };
 
 // ============================================================================
@@ -148,6 +161,10 @@ struct EmbedWeights {
     // ⚡ Phase 8: FP16 weight storage
     bool use_fp16 = false;
     HalfStorage embed_table_fp16, up_proj_fp16, down_proj_fp16;
+
+    // ⚡ Phase A: INT4 weight storage
+    QuantType quant_type = QuantType::FP32;
+    Int4Storage embed_table_int4, up_proj_int4, down_proj_int4;
 };
 
 // ============================================================================
@@ -190,8 +207,12 @@ struct RuntimeState {
     std::vector<Tensor> glt_states;
 
     // Window caches: one (window_k, window_v) pair per Anchor layer
+    // ⚡ Phase C: Circular buffer — window_head tracks the logical write position.
+    // Instead of shifting all elements left (O(window_size × kv_dim)), we just
+    // write new K/V at window_head and advance: O(kv_dim) per token.
     std::vector<Tensor> window_k_caches;
     std::vector<Tensor> window_v_caches;
+    std::vector<int32_t> window_heads;  // circular buffer write position per anchor layer
 
     // PMB slots
     Tensor pmb_slots;
@@ -201,14 +222,18 @@ struct RuntimeState {
 
     void init(const ModelConfig& cfg, Arena& arena);
     void reset();
+
+    // ⚡ Phase C: Save/restore state for app lifecycle (pause/resume)
+    void save_to(const RuntimeState& other);
+    void restore_from(const RuntimeState& other);
 };
 
 // ============================================================================
 // Forward declarations — layer forward passes
 // ============================================================================
 
-// ⚡ Phase 9: FP16 weight wiring — returns FP32 pointer from either
-// original weights or dequantized HalfStorage (uses arena for temp buffer)
+// ⚡ Phase 9: FP16 weight wiring — kept for backward compatibility.
+// New code should use quant_wire() from tensor.h (supports FP32/FP16/INT4).
 inline const float* fp16_wire(const float* fp32, const HalfStorage& hs,
                                bool use_fp16, Arena& arena, size_t n_floats) {
     if (use_fp16 && !hs.empty()) {

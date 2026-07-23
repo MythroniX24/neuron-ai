@@ -56,6 +56,56 @@ struct HalfStorage {
 };
 
 // ============================================================================
+// Int4Storage: 4-bit weight container (Phase A — 2x less bandwidth than FP16)
+// Packs 2 int4 values per byte. Dequantizes to FP32 on-the-fly via arena.
+// For 100M params: 200MB (FP16) → 50MB (INT4) = 4x smaller model file.
+// ============================================================================
+struct Int4Storage {
+    uint8_t* data = nullptr;   // packed: 2 values per byte
+    float* scales = nullptr;   // per-block scale (block_size=32)
+    size_t count = 0;          // number of float values represented
+    size_t num_blocks = 0;     // count / block_size
+    static constexpr int BLOCK_SIZE = 32;
+
+    ~Int4Storage() { if (data) free(data); if (scales) free(scales); }
+    Int4Storage() = default;
+    Int4Storage(const Int4Storage&) = delete;
+    Int4Storage& operator=(const Int4Storage&) = delete;
+    Int4Storage(Int4Storage&& o) noexcept
+        : data(o.data), scales(o.scales), count(o.count), num_blocks(o.num_blocks) {
+        o.data = nullptr; o.scales = nullptr; o.count = 0; o.num_blocks = 0;
+    }
+    Int4Storage& operator=(Int4Storage&& o) noexcept {
+        if (this != &o) {
+            if (data) free(data); if (scales) free(scales);
+            data = o.data; scales = o.scales; count = o.count; num_blocks = o.num_blocks;
+            o.data = nullptr; o.scales = nullptr; o.count = 0; o.num_blocks = 0;
+        }
+        return *this;
+    }
+
+    // Create from FP32 data (quantizes to INT4 with per-block scales)
+    static Int4Storage from_fp32(const float* fp32_data, size_t n);
+
+    // Dequantize into FP32 buffer (must be pre-allocated with count floats)
+    void dequantize(float* fp32_out) const;
+
+    bool empty() const { return data == nullptr || count == 0; }
+};
+
+// ============================================================================
+// Quantization type enum (used by model.h weight structs)
+// ============================================================================
+enum class QuantType { FP32, FP16, INT4 };
+
+// quant_wire() is defined AFTER Arena class (it needs Arena::alloc)
+// Forward declaration:
+inline const float* quant_wire(
+    const float* fp32, const HalfStorage& hs, const Int4Storage& i4,
+    QuantType qt, class Arena& arena, size_t n_floats
+);
+
+// ============================================================================
 // Tensor shape: up to 4 dimensions
 // ============================================================================
 struct TensorShape {
@@ -206,6 +256,29 @@ public:
     size_t used() const { return offset; }
     size_t capacity() const { return size; }
 };
+
+// ============================================================================
+// Generic quantization wiring: dequantize INT4/FP16 weights into arena.
+// Defined here (after Arena) so it can use Arena::alloc().
+// Returns a pointer to FP32 weights — either the original FP32 data or
+// a dequantized copy allocated in the arena for this forward pass.
+// ============================================================================
+inline const float* quant_wire(
+    const float* fp32, const HalfStorage& hs, const Int4Storage& i4,
+    QuantType qt, Arena& arena, size_t n_floats
+) {
+    if (qt == QuantType::INT4 && !i4.empty()) {
+        float* buf = arena.alloc(n_floats);
+        i4.dequantize(buf);
+        return buf;
+    }
+    if (qt == QuantType::FP16 && !hs.empty()) {
+        float* buf = arena.alloc(n_floats);
+        hs.dequantize(buf);
+        return buf;
+    }
+    return fp32;
+}
 
 // ============================================================================
 // Basic tensor operations (in-place and creating new)

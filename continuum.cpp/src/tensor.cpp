@@ -90,6 +90,70 @@ void HalfStorage::dequantize(float* fp32_out) const {
 }
 
 // ============================================================================
+// Int4Storage: 4-bit quantization with per-block scales (Phase A)
+// Block size = 32 values. Each block has one FP32 scale.
+// Values are quantized to [-8, 7] range (signed 4-bit).
+// 2 values packed per byte → 50MB for 100M params (vs 200MB FP16).
+// ============================================================================
+
+Int4Storage Int4Storage::from_fp32(const float* fp32_data, size_t n) {
+    Int4Storage hs;
+    hs.count = n;
+    hs.num_blocks = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+    // Allocate packed data (2 values per byte) + per-block scales
+    size_t packed_bytes = (n + 1) / 2;
+    hs.data = (uint8_t*)aligned_alloc(64, packed_bytes);
+    hs.scales = (float*)aligned_alloc(64, hs.num_blocks * sizeof(float));
+
+    for (size_t b = 0; b < hs.num_blocks; b++) {
+        size_t block_start = b * BLOCK_SIZE;
+        size_t block_end = std::min(block_start + BLOCK_SIZE, n);
+
+        // Find max abs value in block → scale
+        float max_abs = 1e-8f;
+        for (size_t i = block_start; i < block_end; i++) {
+            max_abs = std::max(max_abs, std::abs(fp32_data[i]));
+        }
+        float scale = max_abs / 7.0f;  // 7 = max int4 value
+        hs.scales[b] = scale;
+        float inv_scale = 1.0f / scale;
+
+        // Quantize + pack
+        for (size_t i = block_start; i < block_end; i += 2) {
+            int8_t v0 = (int8_t)std::round(fp32_data[i] * inv_scale);
+            v0 = std::max((int8_t)-8, std::min((int8_t)7, v0));
+            int8_t v1 = 0;
+            if (i + 1 < block_end) {
+                v1 = (int8_t)std::round(fp32_data[i + 1] * inv_scale);
+                v1 = std::max((int8_t)-8, std::min((int8_t)7, v1));
+            }
+            // Pack: high nibble = v0, low nibble = v1 (offset by 8 for unsigned storage)
+            hs.data[i / 2] = (uint8_t)((v0 + 8) << 4) | (uint8_t)(v1 + 8);
+        }
+    }
+    return hs;
+}
+
+void Int4Storage::dequantize(float* fp32_out) const {
+    for (size_t b = 0; b < num_blocks; b++) {
+        size_t block_start = b * BLOCK_SIZE;
+        size_t block_end = std::min(block_start + BLOCK_SIZE, count);
+        float scale = scales[b];
+
+        for (size_t i = block_start; i < block_end; i += 2) {
+            uint8_t byte = data[i / 2];
+            int8_t v0 = (int8_t)(byte >> 4) - 8;
+            fp32_out[i] = (float)v0 * scale;
+            if (i + 1 < block_end) {
+                int8_t v1 = (int8_t)(byte & 0x0F) - 8;
+                fp32_out[i + 1] = (float)v1 * scale;
+            }
+        }
+    }
+}
+
+// ============================================================================
 // Element-wise add: dst = a + b
 // ============================================================================
 void tensor_add(Tensor& dst, const Tensor& a, const Tensor& b) {
