@@ -276,16 +276,23 @@ class ContinuumTrainer:
         loss_for_backward = losses["total"] / total_accumulation_steps
 
         # ⚡ Phase 14: NaN/Inf safety check — CRITICAL for FP16 training stability.
-        # If loss is NaN/Inf, skip this step entirely to prevent weight corruption.
-        # GradScaler.update() will automatically reduce the scale factor, making
-        # future steps more numerically stable. But we must NOT step the optimizer
-        # with NaN gradients — that permanently corrupts all weights.
-        if torch.isinf(loss_for_backward) or torch.isnan(loss_for_backward):
-            # Skip backward + optimizer step — just return a safe loss value
-            if is_optimizer_step and self.scaler is not None:
-                self.scaler.update()  # Reduce scale factor for next step
+        # If loss is NaN/Inf, skip backward() to prevent NaN gradients from
+        # corrupting accumulated gradients from previous micro-steps.
+        #
+        # IMPORTANT: We do NOT call scaler.update() here — calling update() without
+        # a prior scaler.step() would INCREASE the scale factor (GradScaler thinks
+        # everything was fine), making the NEXT step more likely to overflow!
+        # Instead, we just skip this step. On the next normal step, the scaler's
+        # built-in inf/nan detection will handle scale reduction if needed.
+        #
+        # We return 0.0 (not NaN) for loss so epoch_loss averaging isn't corrupted.
+        # ⚡ Use torch.isfinite() for single GPU sync (isinf+isnan = 2 syncs, isfinite = 1)
+        if not torch.isfinite(loss_for_backward):
+            # Log warning so user knows NaN was detected and handled
+            print(f"  ⚠️ NaN/Inf loss at step {self.global_step} — skipping (scale factor will self-adjust)")
+            # Skip backward — prevents NaN from corrupting accumulated gradients
             return {
-                "loss": float("nan"), "ce_loss": 0.0, "ponder_cost": 0.0,
+                "loss": 0.0, "ce_loss": 0.0, "ponder_cost": 0.0,
                 "sparsity_loss": 0.0, "memory_loss": 0.0, "n_loops": 0.0,
                 "lr": self.optimizer.param_groups[0]["lr"], "throughput": 0.0,
             }
