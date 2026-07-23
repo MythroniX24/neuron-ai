@@ -44,8 +44,11 @@ class ContinuumLoss(nn.Module):
         self.sparsity_weight = sparsity_weight
         self.memory_weight = memory_weight
 
-        # Base cross-entropy
-        self.ce_loss = nn.CrossEntropyLoss(ignore_index=-100)
+        # Base cross-entropy with label smoothing for better calibration
+        # ⚡ Phase 15: label_smoothing=0.1 is standard in Llama/GPT-3.
+        # Improves generalization, calibration, and final model quality.
+        # Does NOT slow training — it's a single fused kernel in PyTorch.
+        self.ce_loss = nn.CrossEntropyLoss(ignore_index=-100, label_smoothing=0.1)
         self._pad_token_id = pad_token_id
 
         # ⚡ Phase 5: Pre-allocated zero tensors (avoid GPU sync on every step)

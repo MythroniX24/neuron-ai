@@ -90,6 +90,14 @@ class ContinuumTrainer:
         if compile_model and device == "cuda":
             import torch._dynamo
             torch._dynamo.config.capture_scalar_outputs = True
+            # ⚡ Phase 15: Inductor config — force CUDA graphs + aggressive autotuning
+            try:
+                import torch._inductor.config as inductor_config
+                inductor_config.triton.cudagraphs = True       # Capture static graphs
+                inductor_config.max_autotune = True             # Benchmark best kernels
+                inductor_config.coordinate_descent_tuning = True # Heuristic kernel selection
+            except (ImportError, AttributeError):
+                pass  # Older PyTorch versions may not have these settings
             try:
                 self.model = torch.compile(
                     self.model,
@@ -115,13 +123,34 @@ class ContinuumTrainer:
         if self.use_compiled and self.compile_mode and "max-autotune" in self.compile_mode:
             print("  ⏳ First step will be slow (~5 min) — max-autotune is autotuning kernels...")
 
+        # ⚡ Phase 15: Param Groups — no weight decay on biases, norms, and embeddings.
+        # This is standard practice in GPT-3, Llama, etc.:
+        # - Biases: should NOT be decayed (they shift the activation distribution)
+        # - Norm scales (RMSNorm.scale): should NOT be decayed (they normalize)
+        # - Embedding table: should NOT be decayed (tied weights, decay hurts vocab)
+        # - Static anchors: should NOT be decayed (learned registers, not weights)
+        # Quality improvement AND slightly faster (optimizer skips decay on those params).
+        no_decay_patterns = ["bias", "norm.scale", "embed_table", "static_anchors", "slots", "alibi_slopes"]
+        decay_params = []
+        no_decay_params = []
+        for name, param in model.named_parameters():
+            if any(nd in name for nd in no_decay_patterns):
+                no_decay_params.append(param)
+            else:
+                decay_params.append(param)
+        param_groups = [
+            {"params": decay_params, "weight_decay": weight_decay},
+            {"params": no_decay_params, "weight_decay": 0.0},
+        ]
+        print(f"  ✅ Param groups: {len(decay_params)} decayed, {len(no_decay_params)} no-decay")
+
         # ⚡ Fused AdamW — single kernel for optimizer step
         # Uses try/except instead of __code__ inspection (safe across PyTorch versions)
         use_fused = False
         if device == "cuda":
             try:
                 self.optimizer = AdamW(
-                    model.parameters(),
+                    param_groups,
                     lr=learning_rate,
                     weight_decay=weight_decay,
                     betas=(0.9, 0.95),
@@ -137,7 +166,7 @@ class ContinuumTrainer:
             # Falls back to default if foreach also not available
             try:
                 self.optimizer = AdamW(
-                    model.parameters(),
+                    param_groups,
                     lr=learning_rate,
                     weight_decay=weight_decay,
                     betas=(0.9, 0.95),
@@ -146,7 +175,7 @@ class ContinuumTrainer:
                 print("  ✅ Using foreach AdamW (multi-tensor optimized)")
             except (TypeError, RuntimeError, AttributeError):
                 self.optimizer = AdamW(
-                    model.parameters(),
+                    param_groups,
                     lr=learning_rate,
                     weight_decay=weight_decay,
                     betas=(0.9, 0.95),

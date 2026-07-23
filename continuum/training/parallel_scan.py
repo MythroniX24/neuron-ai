@@ -133,11 +133,14 @@ def glt_parallel_forward(
     #   matmul: [B, L, D, 1] @ [B, L, 1, D] = [B, L, D, D]
     outer = k_safe.unsqueeze(-1) @ v_safe.unsqueeze(-2)
     gated_input = iota.unsqueeze(-1) * outer
-    states = associative_scan(gamma, gated_input)
 
-    # ⚡ FP16 SAFETY: Replace any NaN/Inf from FP16 overflow with 0
-    # Accumulation in associative scan can overflow FP16 range
-    states = torch.nan_to_num(states, nan=0.0, posinf=1e4, neginf=-1e4)
+    # ⚡ Phase 15: FP32 associative scan — prevents FP16 overflow, eliminates nan_to_num
+    scan_dtype = torch.float32
+    gamma_f32 = gamma.to(scan_dtype)
+    gated_input_f32 = gated_input.to(scan_dtype)
+    states = associative_scan(gamma_f32, gated_input_f32)
+    states = states.to(k.dtype)
+    # No nan_to_num needed — FP32 scan doesn't overflow
 
     # ⚡ Optimized: h = sum_{e} S[..., e] * q[..., e] = matmul with q as last dim
     #   states @ q.unsqueeze(-1) → [B, L, D, D] @ [B, L, D, 1] = [B, L, D, 1]
@@ -175,11 +178,22 @@ def glt_parallel_forward_with_state(
     # ⚡ Optimized: unsqueeze matmul instead of einsum
     outer = k_safe.unsqueeze(-1) @ v_safe.unsqueeze(-2)
     gated_input = iota.unsqueeze(-1) * outer
-    states = associative_scan(gamma, gated_input)
 
-    # ⚡ Final FP16 safety (belt-and-suspenders after per-step nan_to_num in scan)
-    # This catches any remaining edge case
-    states = torch.nan_to_num(states, nan=0.0, posinf=1e4, neginf=-1e4)
+    # ⚡ Phase 15: FP32 associative scan — prevents FP16 overflow in state accumulation.
+    # The GLT state S_t accumulates outer products over time. In FP16, values > 65504
+    # cause Inf which propagates through the scan. By running the scan in FP32:
+    # 1. No overflow (FP32 max = 3.4e38)
+    # 2. Eliminates nan_to_num overhead (was a full-tensor kernel launch after scan)
+    # 3. Better numerical stability → better gradient flow → better model quality
+    # Cost: 2x memory for state during scan, but states are [B, L, D, D] which is small
+    # relative to weight gradients. Worth it for stability + speed + quality.
+    scan_dtype = torch.float32
+    gamma_f32 = gamma.to(scan_dtype)
+    gated_input_f32 = gated_input.to(scan_dtype)
+    states = associative_scan(gamma_f32, gated_input_f32)
+    # Cast back to original dtype for subsequent operations
+    states = states.to(k.dtype)
+    # No nan_to_num needed — FP32 scan doesn't overflow for our state sizes
 
     # ⚡ Optimized: matmul instead of einsum
     h = (states @ q.unsqueeze(-1)).squeeze(-1)
