@@ -103,7 +103,11 @@ class AnchorAttention(nn.Module):
         # Shape: [1, 1, n_heads, window_size] — broadcasts correctly with scores [B, L, n_heads, T]
         distances = torch.arange(self.window_size).float()
         alibi_full = -self.alibi_slopes.view(self.n_heads, 1) * distances.view(1, -1)
-        self.register_buffer("alibi_bias_full", alibi_full.view(1, 1, self.n_heads, self.window_size))
+        # ⚡ Shape: [1, n_heads, 1, window_size] — matches alibi_attn_mask layout [1, n_heads, 1, T]
+        # This allows direct slice assignment without broadcasting errors.
+        # (was [1, 1, n_heads, ws] — caused RuntimeError when n_heads != 1)
+        # Uses .reshape() instead of .view() for PyTorch 2.10+ buffer shape normalization robustness.
+        self.register_buffer("alibi_bias_full", alibi_full.reshape(1, self.n_heads, 1, self.window_size))
 
         # Pre-norm
         self.norm = RMSNorm(d_model)
