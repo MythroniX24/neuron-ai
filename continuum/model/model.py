@@ -1109,7 +1109,7 @@ class ContinuumModel(nn.Module):
 # Factory function for standard tiers (Section 17)
 # ============================================================================
 
-def create_continuum_nano(with_vision: bool = False) -> ContinuumModel:
+def create_continuum_nano(vocab_size: int = 8000, with_vision: bool = False) -> ContinuumModel:
     """Create Continuum-Nano: ~5M parameters (~7M with vision)."""
     vision_cfg = ContinuumVisionConfig(
         image_size=224, patch_size=16,
@@ -1119,7 +1119,7 @@ def create_continuum_nano(with_vision: bool = False) -> ContinuumModel:
         ffn_expansion=2, ffn_shards=2,
     ) if with_vision else None
     return ContinuumModel(ContinuumConfig(
-        d_model=192, d_state=48, d_embed=48, vocab_size=8000,
+        d_model=192, d_state=48, d_embed=48, vocab_size=vocab_size,
         n_layers=6, glt_layers=4, anchor_layers=2,
         perception_layers=2, core_layers=2, output_layers=2,
         ffn_expansion=3, ffn_shards=2,
@@ -1131,7 +1131,7 @@ def create_continuum_nano(with_vision: bool = False) -> ContinuumModel:
     ))
 
 
-def create_continuum_small(with_vision: bool = False) -> ContinuumModel:
+def create_continuum_small(vocab_size: int = 12000, with_vision: bool = False) -> ContinuumModel:
     """Create Continuum-Small: ~20M parameters (~25M with vision)."""
     vision_cfg = ContinuumVisionConfig(
         image_size=224, patch_size=16,
@@ -1141,7 +1141,7 @@ def create_continuum_small(with_vision: bool = False) -> ContinuumModel:
         ffn_expansion=3, ffn_shards=2,
     ) if with_vision else None
     return ContinuumModel(ContinuumConfig(
-        d_model=384, d_state=96, d_embed=80, vocab_size=12000,
+        d_model=384, d_state=96, d_embed=80, vocab_size=vocab_size,
         n_layers=8, glt_layers=5, anchor_layers=3,
         perception_layers=3, core_layers=2, output_layers=3,
         ffn_expansion=4, ffn_shards=4,
@@ -1153,7 +1153,7 @@ def create_continuum_small(with_vision: bool = False) -> ContinuumModel:
     ))
 
 
-def create_continuum_max(with_vision: bool = False) -> ContinuumModel:
+def create_continuum_max(vocab_size: int = 16000, with_vision: bool = False) -> ContinuumModel:
     """
     Create Continuum-Max: ~100M parameters (~115M with vision).
     
@@ -1166,6 +1166,10 @@ def create_continuum_max(with_vision: bool = False) -> ContinuumModel:
     ADL: N_max=5, PMB: 64 slots
 
     With vision: Adds 13.5M ViGLT encoder (total ~115M)
+
+    Args:
+        vocab_size: Vocabulary size (default 16000). Use 3834 for pretrained 4K tokenizer.
+        with_vision: If True, include ViGLT vision encoder (disabled during text-only training)
     """
     vision_cfg = ContinuumVisionConfig(
         image_size=224, patch_size=16,
@@ -1175,7 +1179,7 @@ def create_continuum_max(with_vision: bool = False) -> ContinuumModel:
         ffn_expansion=3, ffn_shards=3,
     ) if with_vision else None
     return ContinuumModel(ContinuumConfig(
-        d_model=768, d_state=192, d_embed=160, vocab_size=16000,
+        d_model=768, d_state=192, d_embed=160, vocab_size=vocab_size,
         n_layers=12, glt_layers=9, anchor_layers=3,
         perception_layers=4, core_layers=3, output_layers=5,
         ffn_expansion=4, ffn_shards=6,
