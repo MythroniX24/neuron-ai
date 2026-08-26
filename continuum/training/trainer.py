@@ -75,9 +75,9 @@ class ContinuumTrainer:
         # Checkpointing tells autograd to NOT store intermediate activations —
         # they're recomputed during backward. Saves ~15% VRAM at ~5% compute cost.
         if use_gradient_checkpointing and device == "cuda":
-            import torch.utils.checkpoint as cp
+            from torch.utils.checkpoint import checkpoint as _cp_checkpoint
             _orig_embed = model.embedding.embed
-            model.embedding.embed = lambda token_ids: cp.checkpoint(
+            model.embedding.embed = lambda token_ids: _cp_checkpoint(
                 _orig_embed, token_ids, use_reentrant=False
             )
             print("  ✅ Gradient checkpointing enabled for FactorizedEmbedding (-15% VRAM)")
@@ -93,14 +93,14 @@ class ContinuumTrainer:
         # fullgraph=True: entire model in ONE fused kernel (2-3x faster than reduce-overhead)
         # capture_scalar_outputs: eliminates graph breaks from .item() in ADL inference path
         if compile_model and device == "cuda":
-            import torch._dynamo as _dynamo
-            _dynamo.config.capture_scalar_outputs = True
+            from torch._dynamo import config as _dynamo_config
+            _dynamo_config.capture_scalar_outputs = True
             # ⚡ Phase 15: Inductor config — force CUDA graphs + aggressive autotuning
             try:
-                import torch._inductor.config as inductor_config
-                inductor_config.triton.cudagraphs = True       # Capture static graphs
-                inductor_config.max_autotune = True             # Benchmark best kernels
-                inductor_config.coordinate_descent_tuning = True # Heuristic kernel selection
+                from torch._inductor import config as _inductor_config
+                _inductor_config.triton.cudagraphs = True       # Capture static graphs
+                _inductor_config.max_autotune = True             # Benchmark best kernels
+                _inductor_config.coordinate_descent_tuning = True # Heuristic kernel selection
             except (ImportError, AttributeError):
                 pass  # Older PyTorch versions may not have these settings
             try:
