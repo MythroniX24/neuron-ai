@@ -93,8 +93,8 @@ class ContinuumTrainer:
         # fullgraph=True: entire model in ONE fused kernel (2-3x faster than reduce-overhead)
         # capture_scalar_outputs: eliminates graph breaks from .item() in ADL inference path
         if compile_model and device == "cuda":
-            import torch._dynamo
-            torch._dynamo.config.capture_scalar_outputs = True
+            import torch._dynamo as _dynamo
+            _dynamo.config.capture_scalar_outputs = True
             # ⚡ Phase 15: Inductor config — force CUDA graphs + aggressive autotuning
             try:
                 import torch._inductor.config as inductor_config
