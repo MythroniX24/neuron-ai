@@ -55,6 +55,8 @@ jobs:
           cd continuum
           python -m pytest model/test_model.py -v --tb=short --no-header -k "test_create" 2>&1 || true
           python -m pytest model/test_layers.py -v --tb=short --no-header 2>&1 || true
+          # Audit-fix regression tests (fast, deterministic, CPU-only) — must pass
+          python -m pytest model/test_audit_fixes.py inference/test_engine.py -v --tb=short --no-header
           echo "✅ Tests completed (some may be skipped on CPU)"
 
       - name: Verify model creation

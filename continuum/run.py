@@ -85,21 +85,47 @@ def cmd_train(args):
         tokens = tokenizer.encode_with_special(text, add_bos=True, add_eos=True)
         encoded.append(torch.tensor(tokens))
 
-    # Create DataLoader (simplified)
-    from torch.utils.data import DataLoader, TensorDataset
-    # Pad sequences
+    # Create DataLoaders producing {"input_ids", "labels"} dicts.
+    # ⚡ FIX: trainer.train_step() reads batch["input_ids"], but TensorDataset yielded
+    # plain tuples — `python run.py train` crashed instantly with TypeError.
+    from torch.utils.data import DataLoader, Dataset
     from torch.nn.utils.rnn import pad_sequence
-    padded = pad_sequence(encoded, batch_first=True, padding_value=0)
-    labels = padded.clone()
-    dataset = TensorDataset(padded, labels)
-    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
 
-    # Dummy val loader (split from train)
-    val_size = max(1, len(dataset) // 10)
-    train_dataset = TensorDataset(padded[:-val_size], labels[:-val_size])
-    val_dataset = TensorDataset(padded[-val_size:], labels[-val_size:])
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size)
+    class _TextDataset(Dataset):
+        def __init__(self, sequences):
+            self.sequences = sequences
+
+        def __len__(self):
+            return len(self.sequences)
+
+        def __getitem__(self, idx):
+            ids = self.sequences[idx]
+            return {"input_ids": ids.clone(), "labels": ids.clone()}
+
+    def _collate(batch):
+        input_ids = pad_sequence(
+            [b["input_ids"] for b in batch], batch_first=True, padding_value=0
+        )
+        # ⚡ FIX: pad LABELS with -100 (the loss ignore_index), not 0 — otherwise
+        # every padded position teaches the model to predict <pad>.
+        labels = pad_sequence(
+            [b["labels"] for b in batch], batch_first=True, padding_value=-100
+        )
+        return {"input_ids": input_ids, "labels": labels}
+
+    # Train/val split on the encoded list (before padding)
+    val_size = max(1, len(encoded) // 10)
+    train_loader = DataLoader(
+        _TextDataset(encoded[:-val_size]),
+        batch_size=args.batch_size,
+        shuffle=True,
+        collate_fn=_collate,
+    )
+    val_loader = DataLoader(
+        _TextDataset(encoded[-val_size:]),
+        batch_size=args.batch_size,
+        collate_fn=_collate,
+    )
 
     print(f"Train: {len(train_dataset)} sequences, Val: {len(val_dataset)} sequences")
     print("Starting training...")

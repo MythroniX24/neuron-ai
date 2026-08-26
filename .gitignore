@@ -61,3 +61,8 @@ Thumbs.db
 !continuum/colab/*.ipynb
 !continuum/kaggle/*.ipynb
 !continuum/tokenizer/*.json
+
+# ──────────────────────────────────────────────
+# FREEBUFF SESSION ARTIFACTS
+# ──────────────────────────────────────────────
+.freebuff/

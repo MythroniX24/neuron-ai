@@ -648,7 +648,7 @@ def create_vision_encoder_max(d_model: int = 768) -> ContinuumVisionEncoder:
 
 
 def create_vision_encoder_small(d_model: int = 384) -> ContinuumVisionEncoder:
-    """Create vision encoder for Continuum-Small (~5M params)."""
+    """Create vision encoder for Continuum-Small (~2.6M params measured)."""
     config = ContinuumVisionConfig(
         image_size=224,
         patch_size=16,
@@ -666,7 +666,7 @@ def create_vision_encoder_small(d_model: int = 384) -> ContinuumVisionEncoder:
 
 
 def create_vision_encoder_nano(d_model: int = 192) -> ContinuumVisionEncoder:
-    """Create vision encoder for Continuum-Nano (~2M params)."""
+    """Create vision encoder for Continuum-Nano (~0.9M params measured)."""
     config = ContinuumVisionConfig(
         image_size=224,
         patch_size=16,

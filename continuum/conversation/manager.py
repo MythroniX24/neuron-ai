@@ -113,8 +113,23 @@ class ConversationManager:
         # Add user message
         self.conversation.add_user_message(message)
         
-        # Get formatted prompt
-        prompt = self.conversation.get_prompt(add_generation_prompt=True)
+        # ⚡ FIX: The engine keeps O(1) recurrent state across turns. Re-sending the
+        # FULL transcript every turn double-counted the whole history (it lived once
+        # in the model state AND again in the prompt) and made context grow
+        # unboundedly — defeating the architecture's core design goal. When the
+        # engine already holds conversation state, send ONLY the new turn; use the
+        # full formatted prompt on a cold start.
+        has_active_state = (
+            getattr(self.engine, "glt_states", None) is not None
+            and len(getattr(self.engine, "conversation_tokens", [])) > 0
+        )
+        if has_active_state:
+            prompt = (
+                f"{ChatTemplate.USER_TOKEN}\n{message}\n{ChatTemplate.END_TOKEN}\n"
+                f"{ChatTemplate.ASSISTANT_TOKEN}\n"
+            )
+        else:
+            prompt = self.conversation.get_prompt(add_generation_prompt=True)
         
         # Generate response
         response = self.engine.generate(
@@ -150,8 +165,23 @@ class ConversationManager:
         # Add user message
         self.conversation.add_user_message(message)
         
-        # Get formatted prompt
-        prompt = self.conversation.get_prompt(add_generation_prompt=True)
+        # ⚡ FIX: The engine keeps O(1) recurrent state across turns. Re-sending the
+        # FULL transcript every turn double-counted the whole history (it lived once
+        # in the model state AND again in the prompt) and made context grow
+        # unboundedly — defeating the architecture's core design goal. When the
+        # engine already holds conversation state, send ONLY the new turn; use the
+        # full formatted prompt on a cold start.
+        has_active_state = (
+            getattr(self.engine, "glt_states", None) is not None
+            and len(getattr(self.engine, "conversation_tokens", [])) > 0
+        )
+        if has_active_state:
+            prompt = (
+                f"{ChatTemplate.USER_TOKEN}\n{message}\n{ChatTemplate.END_TOKEN}\n"
+                f"{ChatTemplate.ASSISTANT_TOKEN}\n"
+            )
+        else:
+            prompt = self.conversation.get_prompt(add_generation_prompt=True)
         
         # Generate streaming response
         collected_tokens = []

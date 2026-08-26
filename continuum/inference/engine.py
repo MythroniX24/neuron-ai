@@ -29,6 +29,11 @@ class QuantizedLinear(nn.Module):
 
     Dequantization happens ONCE (on first forward call), then cached for all
     subsequent tokens. Eliminates 102M float operations x num_tokens of overhead.
+
+    NOTE: int8/scale/bias are registered buffers, so they ARE saved in
+    state_dict(). However, a quantized checkpoint can only be loaded back into
+    a model whose Linears were replaced by QuantizedLinear (matching keys).
+    To get a portable checkpoint, export BEFORE quantizing.
     """
 
     def __init__(self, linear: nn.Linear, bits: int = 8):
@@ -36,16 +41,28 @@ class QuantizedLinear(nn.Module):
         self.in_features = linear.in_features
         self.out_features = linear.out_features
         self.bits = bits
-        self.bias = linear.bias.data.clone() if linear.bias is not None else None
 
-        # Quantize weights
+        # ⚡ FIX: Register quantized tensors as BUFFERS so they appear in state_dict().
+        # Previously these were plain Python attributes — torch.save(model.state_dict())
+        # silently DROPPED every quantized layer's weights, producing corrupt
+        # checkpoints (e.g. the Kaggle "continuum_max_int8_phone.pt" export).
         weight = linear.weight.data
         max_val = 2 ** (bits - 1) - 1  # 127 for INT8, 7 for INT4
-        self.scale = weight.abs().max(dim=1, keepdim=True)[0] / max_val
-        self.scale = self.scale.clamp(min=1e-8)
-        self.weight_int8 = torch.round(weight / self.scale).clamp(-max_val, max_val).to(torch.int8)
+        scale = weight.abs().max(dim=1, keepdim=True)[0] / max_val
+        scale = scale.clamp(min=1e-8)
+        weight_q = torch.round(weight / scale).clamp(-max_val, max_val).to(torch.int8)
+        self.register_buffer("scale", scale)
+        self.register_buffer("weight_int8", weight_q)
+        if linear.bias is not None:
+            self.register_buffer("bias", linear.bias.data.clone())
+        else:
+            self.bias = None
 
         self._weight_fp_cached = None
+
+    def _dequantize(self) -> torch.Tensor:
+        """Return the dequantized FP32 weight (int8 * scale)."""
+        return self.weight_int8.float() * self.scale.float()
 
     def _ensure_dequantized(self):
         if self._weight_fp_cached is None:
@@ -103,10 +120,38 @@ def _get_optimal_dtype(device: str) -> torch.dtype:
     return torch.float32
 
 
-def _compile_fast_sample(device: str):
+class _EagerFallbackFn:
+    """Wrap a torch.compile'd callable with a permanent eager fallback.
+
+    torch.compile is lazy — compilation errors surface at CALL time (e.g.
+    InductorError when python3-dev headers are missing on CPU), not at wrap
+    time. This wrapper degrades to the eager function on the first failure
+    instead of crashing every subsequent generate() call.
+    """
+
+    def __init__(self, eager_fn, compiled_fn):
+        self._eager = eager_fn
+        self._compiled = compiled_fn
+        self._broken = False
+
+    def __call__(self, *args, **kwargs):
+        if self._broken:
+            return self._eager(*args, **kwargs)
+        try:
+            return self._compiled(*args, **kwargs)
+        except Exception:
+            # One-time silent degradation; sampling math is identical in eager.
+            self._broken = True
+            return self._eager(*args, **kwargs)
+
+
+def _compile_fast_sample(device: str, enabled: bool = True):
     """Create compiled _fast_sample for the given device.
 
     Called in __init__ so the compile mode matches the actual inference device.
+    ``enabled=False`` returns the pure eager function — use_compile=False must
+    never trigger a compiler (audit fix: it previously did, crashing on
+    machines without C++ build headers).
     """
     mode = _get_compile_mode(device)
 
@@ -174,8 +219,10 @@ def _compile_fast_sample(device: str):
         # 9. Sample
         return torch.multinomial(probs, 1)
 
-    if _HAS_COMPILE:
-        return torch.compile(_fast_sample, fullgraph=False, mode=mode)
+    if _HAS_COMPILE and enabled:
+        return _EagerFallbackFn(
+            _fast_sample, torch.compile(_fast_sample, fullgraph=False, mode=mode)
+        )
     return _fast_sample
 
 
@@ -216,6 +263,19 @@ class ContinuumSpeculativeDecoder:
         self.device = device
         self.dtype = dtype
         self.num_draft_tokens = num_draft_tokens
+
+        # ⚡ FIX: Draft and target MUST share one vocabulary. A Nano draft
+        # (default vocab 8000) paired with a Max target (vocab 3834/16000) would
+        # sample token IDs the target embedding cannot index → hard crash
+        # mid-generation. Fail fast at construction instead.
+        draft_vocab = getattr(draft_model.config, "vocab_size", None)
+        target_vocab = getattr(target_model.config, "vocab_size", None)
+        if draft_vocab is not None and target_vocab is not None and draft_vocab != target_vocab:
+            raise ValueError(
+                f"Speculative decoding requires matching vocab sizes: "
+                f"draft={draft_vocab}, target={target_vocab}. "
+                f"Create both models with the same vocab_size / tokenizer."
+            )
 
         # Move models to device
         draft_model.to(device)
@@ -658,8 +718,9 @@ class ContinuumInference:
             self._warmup_quantized()
             print(f"  Quantized model: {self._estimate_model_size():.1f} MB")
 
-        # Compile _fast_sample for this device
-        self._fast_sample = _compile_fast_sample(device)
+        # Compile _fast_sample for this device (respects use_compile=False;
+        # auto-degrades to eager if compilation fails at call time)
+        self._fast_sample = _compile_fast_sample(device, enabled=bool(use_compile))
 
         # torch.compile the model forward with max-autotune
         self._compiled_forward = None
@@ -739,6 +800,26 @@ class ContinuumInference:
         self.conversation_tokens = []
         self.model.pmb.reset()
         return "Conversation started."
+
+    def _maybe_write_pmb(self):
+        """
+        Write a summary of recent conversation tokens into the Persistent Memory Bank.
+
+        ⚡ FIX: pmb.write() existed but was NEVER called anywhere in production code —
+        the bank was read on every forward pass yet never updated, so "persistent
+        memory" persisted nothing. Now, every config.chunk_size tokens, we pool the
+        embeddings of the recent chunk and apply the gated content-addressed update.
+        The slots ride along with conversation state via serialize_state()/deserialize_state().
+        """
+        if not hasattr(self.model, "pmb") or not self.conversation_tokens:
+            return
+        chunk = int(getattr(self.model.config, "chunk_size", 64) or 64)
+        if len(self.conversation_tokens) % chunk != 0:
+            return
+        recent_ids = self.conversation_tokens[-chunk:]
+        recent = torch.tensor([recent_ids], device=self.device, dtype=torch.long)
+        summary = self.model.embedding.embed(recent).mean(dim=1)  # [1, d_model]
+        self.model.pmb.write(summary)
 
     def resume_conversation(self, state_path: str) -> str:
         """Resume conversation from saved state."""
@@ -871,6 +952,7 @@ class ContinuumInference:
             generated_buf[actual_count] = token_id_val
             actual_count += 1
             self.conversation_tokens.append(int(token_id_val))
+            self._maybe_write_pmb()
 
             # Early exit on EOS (simple, fast, unavoidable for autoregressive)
             if token_id_val == eos_id:
@@ -953,6 +1035,7 @@ class ContinuumInference:
             generated_buf[actual_count] = token_id_val
             actual_count += 1
             self.conversation_tokens.append(int(token_id_val))
+            self._maybe_write_pmb()
 
             # Yield token text before checking EOS (user sees every token)
             yield self.tokenizer.decode([int(token_id_val)])

@@ -422,19 +422,33 @@ class ContinuumModel(nn.Module):
             return x, glt_states, window_caches, n_loops, ponder_cost
 
         # Full ADL path (inference) — looping with halting
+        #
+        # ⚡ FIX: Snapshot the core anchor window caches BEFORE looping. Previously
+        # every loop iteration appended the SAME token into each core anchor's
+        # window cache, duplicating it up to N_max times per generated token.
+        # Caches are now frozen during looping; after halting we apply exactly
+        # ONE update per anchor layer using the final iteration's block inputs.
+        n_core_anchors = sum(1 for b in self.core_blocks if b.is_anchor)
+        core_window_start = sum(1 for b in self.perception_blocks if b.is_anchor)
+        saved_core_caches = [
+            tuple(t.clone() for t in window_caches[core_window_start + i])
+            for i in range(n_core_anchors)
+        ]
+        last_anchor_inputs = {}
+
         for loop in range(n_loops_max):
-            # Run core blocks
-            for block in self.core_blocks:
+            # Run core blocks (window caches intentionally NOT mutated here)
+            anchor_j = 0
+            for j, block in enumerate(self.core_blocks):
                 if block.is_glt:
                     x, new_state = block.forward_glt(x, glt_states[state_idx])
                     glt_states[state_idx] = new_state
                     state_idx += 1
                 else:
-                    wk, wv = window_caches[window_idx]
+                    wk, wv = window_caches[core_window_start + anchor_j]
                     x, block_input = block.forward_anchor(x, wk, wv, pmb_readouts)
-                    wk, wv = block.mixer.update_window_cache(block_input, wk, wv)
-                    window_caches[window_idx] = (wk, wv)
-                    window_idx += 1
+                    last_anchor_inputs[anchor_j] = block_input
+                    anchor_j += 1
 
             # Reset indices for next loop
             state_idx = len(self.perception_blocks)
@@ -450,6 +464,18 @@ class ContinuumModel(nn.Module):
             cumulative_p = torch.stack(halting_probs, dim=0).sum(dim=0)  # [B, 1]
             if cumulative_p.min() >= config.halt_threshold:
                 break
+
+        # ⚡ FIX (ADL): exactly ONE window-cache update per core anchor layer,
+        # based on pre-loop caches + the final loop iteration's inputs.
+        core_anchor_mixers = [b.mixer for b in self.core_blocks if b.is_anchor]
+        for a_j, mixer in enumerate(core_anchor_mixers):
+            bi = last_anchor_inputs.get(a_j)
+            wk_saved, wv_saved = saved_core_caches[a_j]
+            if bi is not None:
+                wk_new, wv_new = mixer.update_window_cache(bi, wk_saved, wv_saved)
+            else:
+                wk_new, wv_new = wk_saved, wv_saved
+            window_caches[core_window_start + a_j] = (wk_new, wv_new)
 
         # ACT-style weighted combination
         n_loops = len(halting_probs)
@@ -593,44 +619,42 @@ class ContinuumModel(nn.Module):
             
             else:
                 # ---- Anchor: Batched attention ----
-                # ⚡ Static cache already refreshed in forward/forward_parallel
-                # (not refreshed here to avoid redundant matmuls)
-                wk, wv = window_caches[window_idx]
-                
-                # Run attention on full sequence with causal masking
-                o = block.mixer(x, wk, wv, pmb_readouts, causal_mask=True)
-                o = block.ffn(o)
-                
-                # Update window cache: store K/V for last window_size tokens
+                # ⚡ FIX: Attend over [anchors | CURRENT CHUNK K/V] with an exact
+                # causal mask. Previously this attended over the PREVIOUS stage's
+                # stale window cache (the last-ws tokens of the same sequence),
+                # which leaked future tokens into early positions and misaligned
+                # the causal mask whenever L != window_size. Using the current
+                # chunk as keys with slot-aligned causal masking matches standard
+                # teacher-forced attention and the sequential decode semantics.
+                B, L, _ = x.shape
                 n_kv = block.mixer.n_kv_heads
                 hd = block.mixer.head_dim
                 ws = block.mixer.window_size
-                B, L, _ = x.shape
-                
-                # Take up to ws last tokens (may be fewer if L < ws)
-                last_x = block.mixer.norm(x[:, -ws:, :])  # [B, min(L, ws), d_model]
-                actual_ws = last_x.shape[1]
-                # ⚡ Phase 10: Direct fused KV matmul (no torch.cat! Uses pre-concatenated weight)
-                # Uses _get_fused_kv_weight() with version-based lazy refresh
-                kv_all = F.linear(last_x, block.mixer._get_fused_kv_weight())  # [B, actual_ws, 2*kv_dim]
-                new_wk_flat, new_wv_flat = kv_all.split(
-                    [block.mixer.kv_dim, block.mixer.kv_dim], dim=-1
-                )
-                
-                # Pad with zeros on the LEFT if fewer tokens than window_size.
-                # Matches sequential behavior: window starts all-zeros, fills from right.
+
+                x_norm_full = block.mixer.norm(x)  # [B, L, d_model]
+                kv_all = F.linear(x_norm_full, block.mixer._get_fused_kv_weight())  # [B, L, 2*kv_dim]
+                ck, cv = kv_all.split([block.mixer.kv_dim, block.mixer.kv_dim], dim=-1)
+                cur_k = ck.view(B, L, n_kv, hd)
+                cur_v = cv.view(B, L, n_kv, hd)
+
+                # Attention over anchors + current chunk (causal within chunk).
+                # NOTE: K/V are intentionally NOT left-padded here — the causal
+                # mask assumes window slot j == sequence position j.
+                o = block.mixer(x, cur_k, cur_v, pmb_readouts, causal_mask=True)
+                o = block.ffn(o)
+
+                # Update this layer's persistent window cache with the LAST ws tokens
+                wk_new, wv_new = cur_k[:, -ws:, :, :], cur_v[:, -ws:, :, :]
+                actual_ws = wk_new.shape[1]
                 if actual_ws < ws:
                     pad = ws - actual_ws
-                    pk = torch.zeros(B, pad, n_kv * hd, device=x.device, dtype=new_wk_flat.dtype)
-                    pv = torch.zeros(B, pad, n_kv * hd, device=x.device, dtype=new_wv_flat.dtype)
-                    new_wk_flat = torch.cat([pk, new_wk_flat], dim=1)
-                    new_wv_flat = torch.cat([pv, new_wv_flat], dim=1)
-                
-                new_wk = new_wk_flat.view(B, ws, n_kv, hd)
-                new_wv = new_wv_flat.view(B, ws, n_kv, hd)
-                window_caches[window_idx] = (new_wk, new_wv)
+                    pk = torch.zeros(B, pad, n_kv, hd, device=x.device, dtype=wk_new.dtype)
+                    pv = torch.zeros(B, pad, n_kv, hd, device=x.device, dtype=wv_new.dtype)
+                    wk_new = torch.cat([pk, wk_new], dim=1)
+                    wv_new = torch.cat([pv, wv_new], dim=1)
+                window_caches[window_idx] = (wk_new, wv_new)
                 window_idx += 1
-                
+
                 x = o  # Anchor already includes residual
         
         return x, glt_states, window_caches

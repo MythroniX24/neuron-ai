@@ -24,26 +24,99 @@ _tokenizer = None
 _model_loaded = False
 
 
+def _find_checkpoint():
+    """Locate a trained checkpoint: env var first, then conventional paths."""
+    candidates = []
+    env = os.environ.get("NEURON_MODEL_PATH")
+    if env:
+        candidates.append(env)
+    ckpt_dir = os.path.normpath(
+        os.path.join(os.path.dirname(__file__), "..", "..", "checkpoints")
+    )
+    for name in ("best_model.pt", "continuum_max_for_mobile.pt"):
+        candidates.append(os.path.join(ckpt_dir, name))
+    import glob as _glob
+    candidates.extend(sorted(_glob.glob(os.path.join(ckpt_dir, "*.pt"))))
+    for c in candidates:
+        if c and os.path.exists(c):
+            return c
+    return None
+
+
+def _find_tokenizer(vocab_size):
+    """Load the repo's pretrained BPE tokenizer if present, else a fallback."""
+    from continuum.tokenizer.bpe import ContinuumTokenizer
+
+    tok_path = os.environ.get(
+        "NEURON_TOKENIZER_PATH",
+        os.path.normpath(
+            os.path.join(os.path.dirname(__file__), "..", "tokenizer", "tokenizer_4k.json")
+        ),
+    )
+    if os.path.exists(tok_path):
+        print(f"Loading tokenizer from {tok_path}")
+        return ContinuumTokenizer.load(tok_path)
+    print("No trained tokenizer found — using untrained byte-level fallback.")
+    return ContinuumTokenizer(vocab_size=vocab_size)
+
+
 def get_model():
-    """Lazy-load the model on first request."""
+    """Lazy-load the model on first request.
+
+    ⚡ FIX: this used to build a RANDOM-INIT nano model with an UNTRAINED tokenizer
+    and never touched any saved weights — the chat endpoint could never produce
+    meaningful output (and INT8 quantization crashed it outright). It now loads a
+    trained checkpoint (NEURON_MODEL_PATH env var or checkpoints/*.pt) plus its
+    tokenizer (NEURON_TOKENIZER_PATH / repo tokenizer_4k.json).
+    INT8 quantization is opt-in via NEURON_QUANTIZE=1 now that the quantized
+    forward path works.
+    """
     global _inference_engine, _tokenizer, _model_loaded
 
     if not _model_loaded:
         try:
-            from continuum.model.model import create_continuum_nano
+            import torch
+            from continuum.model.model import create_continuum_nano, ContinuumModel
             from continuum.inference.engine import ContinuumInference
-            from continuum.tokenizer.bpe import ContinuumTokenizer
 
-            print("Loading Continuum-Nano model...")
-            model = create_continuum_nano()
-            tokenizer = ContinuumTokenizer(vocab_size=model.config.vocab_size)
+            ckpt_path = _find_checkpoint()
+            if ckpt_path:
+                print(f"Loading checkpoint: {ckpt_path}")
+                checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+                config = checkpoint["config"]
+                state_dict = checkpoint.get("model_state_dict", checkpoint)
+
+                # INT8 runtime exports hold QuantizedLinear buffer keys — they only
+                # load into an already-quantized model skeleton, so reject them here.
+                if any(k.endswith("weight_int8") for k in state_dict.keys()):
+                    print("⚠️ INT8 runtime export detected — cannot load into a plain "
+                          "model. Export FP32 checkpoints for serving. Using untrained model.")
+                    model = create_continuum_nano()
+                else:
+                    model = ContinuumModel(config)
+                    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+                    if missing:
+                        print(f"⚠️ {len(missing)} missing keys (e.g. {missing[0]})")
+                    if unexpected:
+                        print(f"⚠️ {len(unexpected)} unexpected keys (e.g. {unexpected[0]})")
+            else:
+                print("No checkpoint found — creating untrained Continuum-Nano.")
+                model = create_continuum_nano()
+
+            tokenizer = _find_tokenizer(model.config.vocab_size)
+            if tokenizer.vocab_size_actual != model.config.vocab_size:
+                print(f"⚠️ Tokenizer vocab ({tokenizer.vocab_size_actual}) != model vocab "
+                      f"({model.config.vocab_size}) — generation will still run "
+                      f"(token IDs are a safe subset), but quality may suffer.")
 
             engine = ContinuumInference(
                 model=model,
                 tokenizer=tokenizer,
                 device="cpu",
-                quantize=True,
+                quantize=os.environ.get("NEURON_QUANTIZE", "0") == "1",
+                use_compile=False,  # keeps server startup fast and robust
             )
+            engine.start_conversation()
 
             _inference_engine = engine
             _tokenizer = tokenizer

@@ -69,9 +69,10 @@ def test_anchor_attention_alibi():
     assert attn.alibi_slopes.shape == (4,), f"Expected 4 slopes, got {attn.alibi_slopes.shape}"
     # Slopes should be decreasing (more negative for later heads)
     assert attn.alibi_slopes[0] > attn.alibi_slopes[-1], "ALiBi slopes should decrease"
-    # Check precomputed bias shape — [1, 1, n_heads, window_size] for correct broadcasting
-    assert attn.alibi_bias_full.shape == (1, 1, 4, 48), \
-        f"Expected (1,1,4,48), got {attn.alibi_bias_full.shape}"
+    # Check precomputed bias shape — [1, n_heads, 1, window_size] so it slices
+    # directly into alibi_attn_mask [1, n_heads, 1, total_kv_len]
+    assert attn.alibi_bias_full.shape == (1, 4, 1, 48), \
+        f"Expected (1,4,1,48), got {attn.alibi_bias_full.shape}"
     # Bias should be negative (penalty for distance)
     assert (attn.alibi_bias_full <= 0).all(), "ALiBi bias should be non-positive"
 

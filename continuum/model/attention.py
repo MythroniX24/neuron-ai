@@ -7,6 +7,8 @@ Implements Sections 7 and 12 of the architecture:
 """
 
 import math
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -109,6 +111,33 @@ class AnchorAttention(nn.Module):
         # Uses .reshape() instead of .view() for PyTorch 2.10+ buffer shape normalization robustness.
         self.register_buffer("alibi_bias_full", alibi_full.reshape(1, self.n_heads, 1, self.window_size))
 
+        # Runtime flex policy: flex_attention is only fully supported on CUDA.
+        # On CPU it requires Inductor C++ compilation (python3-dev headers) for
+        # the score-mod kernel AND does not support backward at all — so we
+        # default to the SDPA path there. Env overrides:
+        #   CONTINUUM_FORCE_FLEX=1 → use flex even on CPU (forward-only use)
+        #   CONTINUUM_NO_FLEX=1    → never use flex, even on CUDA
+        self._force_flex = os.environ.get("CONTINUUM_FORCE_FLEX") == "1"
+        self._no_flex = os.environ.get("CONTINUUM_NO_FLEX") == "1"
+
+        # ⚡ FIX: Probe flex_attention ONCE at construction — but only when a GPU
+        # is present (on CPU-only machines the probe itself triggers an Inductor
+        # compile that fails without python3-dev, wasting seconds per module).
+        # If the probe fails we silently use the SDPA path instead of crashing
+        # every forward.
+        if _FLEX_AVAILABLE and torch.cuda.is_available():
+            try:
+                _q = torch.zeros(1, self.n_heads, 2, self.head_dim)
+                _k = torch.zeros(1, self.n_kv_heads, self.n_static_anchors + 2, self.head_dim)
+                _sm = self._make_flex_score_mod(self.n_static_anchors, causal_mask=True)
+                try:
+                    flex_attention(_q, _k, _k.clone(), score_mod=_sm, enable_gqa=True)
+                except TypeError:
+                    # Older flex signature without enable_gqa (PyTorch 2.5)
+                    flex_attention(_q, _k, _k.clone(), score_mod=_sm)
+            except Exception:
+                self._flex_available = False
+
         # Pre-norm
         self.norm = RMSNorm(d_model)
 
@@ -130,7 +159,30 @@ class AnchorAttention(nn.Module):
         
         Uses _version (PyTorch's inplace mutation counter) to detect optimizer updates.
         Rebuilds via torch.cat only when stale — eliminates per-forward torch.cat overhead.
+
+        ⚡ FIX: QuantizedLinear replaces W_qkv during INT8 inference and has NO .weight
+        attribute — the old code crashed with AttributeError on every forward pass of a
+        quantized model. Now dequantizes and slices for quantized formats too (cached,
+        since quantized weights never change at runtime).
         """
+        fmt = getattr(self, "_w_qkv_format", "linear")
+        if fmt == "int8":
+            if getattr(self, "_fused_kv_quant_cache", None) is None:
+                w = self.W_qkv._dequantize()
+                self._fused_kv_quant_cache = torch.cat([
+                    w[self.q_dim:self.q_dim + self.kv_dim],
+                    w[self.q_dim + self.kv_dim:self.q_dim + 2 * self.kv_dim]
+                ], dim=0)
+            return self._fused_kv_quant_cache
+        if fmt in ("int4", "quantized"):
+            if getattr(self, "_fused_kv_quant_cache", None) is None:
+                w = self.W_qkv._dequantize()
+                self._fused_kv_quant_cache = torch.cat([
+                    w[self.q_dim:self.q_dim + self.kv_dim],
+                    w[self.q_dim + self.kv_dim:self.q_dim + 2 * self.kv_dim]
+                ], dim=0)
+            return self._fused_kv_quant_cache
+
         ver = self.W_qkv.weight._version
         if self._fused_kv_weight is None or self._fused_kv_version != ver:
             # ⚡ Keep autograd tracking (NO .data!) — gradients must flow through window cache
@@ -210,21 +262,28 @@ class AnchorAttention(nn.Module):
         """
         alibi_slopes = self.alibi_slopes  # captured as lifted parameter
 
+        # ⚡ FIX: score_mod must be BRANCHLESS. Newer PyTorch (2.13+) traces
+        # score_mod with Dynamo even in eager mode, and Python `if tensor:`
+        # branches raise a fundamental Unsupported error there. Pure tensor ops
+        # (where / arithmetic) trace cleanly on every version.
         if causal_mask:
             def score_mod(score, b, h, q_idx, kv_idx):
-                if kv_idx < n_anchors:
-                    return score
+                is_anchor = kv_idx < n_anchors
                 window_pos = kv_idx - n_anchors
-                if window_pos >= q_idx:
-                    return float('-inf')
-                return score - alibi_slopes[h] * window_pos
+                biased = score - alibi_slopes[h] * window_pos
+                masked = torch.where(
+                    window_pos >= q_idx,
+                    score.new_full((), float("-inf")),
+                    biased,
+                )
+                return torch.where(is_anchor, score, masked)
             return score_mod
         else:
             def score_mod(score, b, h, q_idx, kv_idx):
-                if kv_idx < n_anchors:
-                    return score
+                is_anchor = kv_idx < n_anchors
                 window_pos = kv_idx - n_anchors
-                return score - alibi_slopes[h] * window_pos
+                biased = score - alibi_slopes[h] * window_pos
+                return torch.where(is_anchor, score, biased)
             return score_mod
 
     def forward(
@@ -306,7 +365,15 @@ class AnchorAttention(nn.Module):
         # Removes: bias tensor allocation, tensor.cat for mask, manual GQA repeat,
         #          and the associated CPU-GPU sync points (graph breaks).
         # Falls back to SDPA for single-token inference (L==1) or older PyTorch.
-        if self._flex_available and L > 1:
+        # Device-aware gating: flex kernels are compiled for/validated on CUDA;
+        # CPU falls back to SDPA unless explicitly forced via CONTINUUM_FORCE_FLEX.
+        use_flex = (
+            self._flex_available
+            and L > 1
+            and not self._no_flex
+            and (self._force_flex or q.is_cuda)
+        )
+        if use_flex:
             # ⚡ OPTIMIZE: Use cached score_mod keyed on (anchor_count, causal_mask)
             # anchor_count differs when pmb_readouts is present vs absent — must key on both.
             cache_key = (anchor_count, causal_mask)
@@ -346,8 +413,16 @@ class AnchorAttention(nn.Module):
             # Shape: [1, n_heads, 1, total_kv_len] — broadcasts with Q@K^T [B, n_heads, L, T]
             alibi_attn_mask = torch.zeros(1, self.n_heads, 1, total_kv_len, device=x.device, dtype=q.dtype)
             if ws_len > 0:
-                alibi_attn_mask[:, :, :, anchor_count:] = \
-                    self.alibi_bias_full.to(device=x.device, dtype=q.dtype)[:, :, :, :ws_len]
+                if ws_len <= self.window_size:
+                    alibi_attn_mask[:, :, :, anchor_count:] = \
+                        self.alibi_bias_full.to(device=x.device, dtype=q.dtype)[:, :, :, :ws_len]
+                else:
+                    # ⚡ Parallel-training path can pass more window keys than the
+                    # persistent cache size (current chunk as K/V). Build the bias
+                    # dynamically so shapes always line up.
+                    distances = torch.arange(ws_len, device=x.device, dtype=q.dtype)
+                    dyn = -self.alibi_slopes.to(device=x.device, dtype=q.dtype).view(self.n_heads, 1) * distances.view(1, -1)
+                    alibi_attn_mask[:, :, :, anchor_count:] = dyn.reshape(1, self.n_heads, 1, ws_len)
 
             if causal_mask and L > 1:
                 # Add causal mask: -inf for window positions where kv_pos >= q_pos
