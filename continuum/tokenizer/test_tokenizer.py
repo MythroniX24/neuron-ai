@@ -183,3 +183,53 @@ if __name__ == "__main__":
     print("\n" + "=" * 60)
     print("All tests passed! ✓")
     print("=" * 60)
+
+
+# ============================================================================
+# Fast rank-based encoder (audit fix: 9.5h tokenization → minutes)
+# ============================================================================
+
+def _load_pretrained():
+    path = os.path.join(os.path.dirname(__file__), "tokenizer_4k.json")
+    return ContinuumTokenizer.load(path)
+
+
+def test_fast_encode_matches_reference():
+    """New rank-based encode() must produce IDENTICAL output to the legacy
+    scan-every-merge encoder on diverse inputs (numbers, unicode, repeats)."""
+    tok = _load_pretrained()
+    samples = [
+        "Hello world!",
+        "the capital of france is paris .",
+        "numbers 12345 and 42 must stay single digits",
+        "Mixed text with punctuation, quotes \"and\" apostrophes.",
+        "aabbaabb" * 40 + " 7 " + "ccddccdd" * 25,
+    ]
+    for s in samples:
+        fast = tok.encode(s)
+        ref = tok._encode_reference(s)
+        assert fast == ref, (
+            f"fast/reference mismatch on {s[:40]!r}: "
+            f"{fast[:12]}... vs {ref[:12]}..."
+        )
+
+
+def test_pretrained_roundtrip_and_digits():
+    """decode(encode(s)) == s on the pretrained 4K tokenizer; digits survive."""
+    tok = _load_pretrained()
+    for s in ["Train number 9 leaves at 8 pm.",
+              "Total: 1234567890 rupees only."]:
+        assert tok.decode(tok.encode(s)) == s, f"roundtrip failed for {s!r}"
+
+
+def test_encode_speed_large_corpus():
+    """~90KB must encode in seconds, not minutes (regression guard for the
+    O(merges x seq_len) bug that cost 9.5h on Kaggle)."""
+    import time
+    tok = _load_pretrained()
+    text = "the quick brown fox jumps over the lazy dog . " * 2000
+    t0 = time.perf_counter()
+    ids = tok.encode(text)
+    dt = time.perf_counter() - t0
+    assert len(ids) > 1000
+    assert dt < 5.0, f"encode too slow: {dt:.2f}s for {len(text)} chars"
