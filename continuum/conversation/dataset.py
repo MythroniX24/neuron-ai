@@ -519,7 +519,7 @@ class ConversationalDataset:
         num_workers: int = 2,
         pin_memory: bool = True,
         prefetch_factor: int = 4,
-        use_persistent_workers: bool = True,
+        persistent_workers: bool = True,
         worker_init_fn = None,
     ):
         """
@@ -654,7 +654,7 @@ class ConversationalDataset:
             collate_fn=collate_fn,
             num_workers=num_workers,
             pin_memory=pin_memory,
-            persistent_workers=use_persistent_workers and num_workers > 0,
+            persistent_workers=persistent_workers and num_workers > 0,
             prefetch_factor=prefetch_factor if num_workers > 0 else None,
             worker_init_fn=worker_init_fn,
         )
