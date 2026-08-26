@@ -25,6 +25,24 @@ except ImportError:
     _FLEX_AVAILABLE = False
 
 
+def _is_compiling() -> bool:
+    """True while tracing under torch.compile.
+
+    flex_attention only pays off when its score_mod is fused into a Triton
+    kernel by the compiler. Run eagerly, it materializes the FULL scores
+    matrix in eager mode (PyTorch emits a UserWarning about exactly this)
+    and measures slower than SDPA's fused memory-efficient kernel —
+    confirmed by pytorch/pytorch#161473. So eager execution (CPU *and* CUDA)
+    defaults to the SDPA path; flex engages automatically when the model is
+    torch.compile'd, or via CONTINUUM_FORCE_FLEX=1.
+    """
+    try:
+        import torch._dynamo
+        return torch._dynamo.is_compiling()
+    except Exception:
+        return False
+
+
 # ============================================================================
 # Anchor Attention (Section 7)
 # ============================================================================
@@ -111,10 +129,10 @@ class AnchorAttention(nn.Module):
         # Uses .reshape() instead of .view() for PyTorch 2.10+ buffer shape normalization robustness.
         self.register_buffer("alibi_bias_full", alibi_full.reshape(1, self.n_heads, 1, self.window_size))
 
-        # Runtime flex policy: flex_attention is only fully supported on CUDA.
-        # On CPU it requires Inductor C++ compilation (python3-dev headers) for
-        # the score-mod kernel AND does not support backward at all — so we
-        # default to the SDPA path there. Env overrides:
+        # Runtime flex policy: flex_attention is only a win when fused by
+        # torch.compile. Eager flex (CPU *or* CUDA) materializes the full
+        # scores matrix and is slower than SDPA's fused mem-efficient kernel,
+        # so eager runs default to SDPA. Env overrides:
         #   CONTINUUM_FORCE_FLEX=1 → use flex even on CPU (forward-only use)
         #   CONTINUUM_NO_FLEX=1    → never use flex, even on CUDA
         self._force_flex = os.environ.get("CONTINUUM_FORCE_FLEX") == "1"
@@ -364,14 +382,16 @@ class AnchorAttention(nn.Module):
         # Uses score_mod for ALiBi + causal masking instead of materializing bias tensors.
         # Removes: bias tensor allocation, tensor.cat for mask, manual GQA repeat,
         #          and the associated CPU-GPU sync points (graph breaks).
-        # Falls back to SDPA for single-token inference (L==1) or older PyTorch.
-        # Device-aware gating: flex kernels are compiled for/validated on CUDA;
-        # CPU falls back to SDPA unless explicitly forced via CONTINUUM_FORCE_FLEX.
+        # Falls back to SDPA for single-token inference (L==1), older PyTorch,
+        # or eager execution — uncompiled flex is SLOWER than SDPA (it
+        # materializes the full scores matrix; see _is_compiling docstring).
+        # Flex engages automatically under torch.compile tracing, or when
+        # forced via CONTINUUM_FORCE_FLEX=1.
         use_flex = (
             self._flex_available
             and L > 1
             and not self._no_flex
-            and (self._force_flex or q.is_cuda)
+            and (self._force_flex or (q.is_cuda and _is_compiling()))
         )
         if use_flex:
             # ⚡ OPTIMIZE: Use cached score_mod keyed on (anchor_count, causal_mask)

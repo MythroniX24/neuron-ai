@@ -63,6 +63,11 @@ class ContinuumTrainer:
         self.use_amp = use_amp and (device == "cuda")
 
         self.model.to(device)
+        if device == "cuda":
+            # ⚡ cudnn autotuner: benchmarks kernels once per input shape, then reuses.
+            # Bucket sampler yields ~a dozen distinct shapes — tiny one-off cost,
+            # faster kernels for the entire run.
+            torch.backends.cudnn.benchmark = True
         self.use_parallel_forward = use_parallel_forward
 
         # ⚡ Phase 8: Gradient checkpointing for FactorizedEmbedding
