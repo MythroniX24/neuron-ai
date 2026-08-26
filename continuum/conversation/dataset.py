@@ -180,12 +180,30 @@ class ConversationalDataset:
     def _format_and_tokenize(self, conversation: List[Dict], mask_non_assistant: bool = True) -> List[Tuple[List[int], List[int]]]:
         """
         Format a conversation and tokenize it.
-        
+
         Returns list of (input_ids, labels) pairs, potentially
         splitting long conversations into multiple chunks.
-        
+
         If mask_non_assistant=True, loss is only computed for
         assistant response tokens (not user/system prompts).
+        """
+        return self._tokenize_conversation_core(
+            self.tokenizer, self.chat_template, conversation,
+            self.max_seq_len, mask_non_assistant,
+        )
+
+    @staticmethod
+    def _tokenize_conversation_core(
+        tokenizer,
+        chat_template,
+        conversation: List[Dict],
+        max_seq_len: int,
+        mask_non_assistant: bool = True,
+    ) -> List[Tuple[List[int], List[int]]]:
+        """Pure (self-free) core of _format_and_tokenize.
+
+        Kept static so multiprocessing workers can run the EXACT same logic
+        (identical token IDs and label masks as serial tokenization).
         """
         # Convert to Message objects
         messages = []
@@ -195,34 +213,36 @@ class ConversationalDataset:
                 messages.append(Message(role, turn["content"]))
             except Exception:
                 continue
-        
+
         if not messages:
             return []
-        
+
         # Format full conversation
         formatted = ChatTemplate(add_generation_prompt=False).format_messages(messages)
-        
+
         if not formatted or not formatted.strip():
             return []
-        
+
         # Tokenize
-        tokens = self.tokenizer.encode_with_special(
+        tokens = tokenizer.encode_with_special(
             formatted, add_bos=True, add_eos=True
         )
-        
+
         if not tokens or len(tokens) < 5:
             return []
-        
+
         # Split into chunks if too long
         chunks = []
-        max_len = self.max_seq_len
-        
+        max_len = max_seq_len
+
         if len(tokens) <= max_len:
             # Single chunk
             input_ids = tokens[:-1]
             labels = tokens[1:]
             if mask_non_assistant:
-                labels = self._mask_non_assistant_tokens(labels, input_ids)
+                labels = ConversationalDataset._mask_non_assistant_tokens_static(
+                    tokenizer, chat_template.ASSISTANT_TOKEN, labels, input_ids
+                )
             chunks.append((input_ids, labels))
         else:
             # Split into overlapping chunks
@@ -235,30 +255,38 @@ class ConversationalDataset:
                 input_ids = chunk[:-1]
                 labels = chunk[1:]
                 if mask_non_assistant:
-                    labels = self._mask_non_assistant_tokens(labels, input_ids)
+                    labels = ConversationalDataset._mask_non_assistant_tokens_static(
+                        tokenizer, chat_template.ASSISTANT_TOKEN, labels, input_ids
+                    )
                 chunks.append((input_ids, labels))
                 if end == len(tokens):
                     break
-        
+
         return chunks
-    
+
     def _mask_non_assistant_tokens(self, labels: List[int], tokens: List[int]) -> List[int]:
         """
         Mask loss for non-assistant tokens so the model only learns
         to predict assistant responses (not user/system prompts).
-        
+
         Tokens before the first <|assistant|> token are set to -100 (ignore).
         """
+        return self._mask_non_assistant_tokens_static(
+            self.tokenizer, self.chat_template.ASSISTANT_TOKEN, labels, tokens
+        )
+
+    @staticmethod
+    def _mask_non_assistant_tokens_static(tokenizer, assistant_pattern: str, labels: List[int], tokens: List[int]) -> List[int]:
+        """Static core of _mask_non_assistant_tokens (worker-safe)."""
         # Find all occurrences of assistant token
-        assistant_pattern = self.chat_template.ASSISTANT_TOKEN
-        assistant_ids = self.tokenizer.encode(assistant_pattern)
-        
+        assistant_ids = tokenizer.encode(assistant_pattern)
+
         if not assistant_ids:
             return labels
-        
+
         # Simple approach: find positions where assistant starts
         masked = [-100] * len(labels)
-        
+
         # Find positions where assistant response begins
         i = 0
         in_assistant = False
@@ -269,21 +297,21 @@ class ConversationalDataset:
                     in_assistant = True
                     i += len(assistant_ids)
                     continue
-            
+
             if in_assistant:
                 if i < len(labels):
                     # Check for end token or next user token
-                    if tokens[i] == self.tokenizer.eos_id:
+                    if tokens[i] == tokenizer.eos_id:
                         in_assistant = False
                         if i < len(labels):
                             masked[i] = labels[i]
                     else:
                         masked[i] = labels[i]
-            
+
             i += 1
-        
+
         return masked
-    
+
     def add_sample(self, conversation: List[Dict]):
         """Add a single conversation to the dataset."""
         chunks = self._format_and_tokenize(conversation)
@@ -322,6 +350,8 @@ class ConversationalDataset:
         include_alpaca: bool = True,
         include_tulu: bool = False,
         max_samples: Optional[int] = None,
+        cache_path: Optional[str] = None,
+        num_workers: Optional[int] = None,
     ):
         """
         Load datasets from HuggingFace hub.
@@ -368,10 +398,47 @@ class ConversationalDataset:
             print("   Please check your internet connection.")
             return
         
+        # ⚡ Disk cache: skip re-tokenization entirely on re-runs
+        if cache_path and os.path.exists(cache_path):
+            loaded = self.load(cache_path, self.tokenizer)
+            self.samples = loaded.samples
+            print(f"\n⚡ CACHE HIT — {len(self.samples)} samples from {cache_path}")
+            print("   (delete the file to force re-tokenization)")
+            return
+
         print(f"\n📝 Tokenizing {len(all_conversations)} conversations...")
-        for item in tqdm(all_conversations):
-            self.add_sample(item["conversation"])
-        
+        workers = num_workers if num_workers is not None else min(4, os.cpu_count() or 1)
+        conversations = [item["conversation"] for item in all_conversations]
+
+        if workers > 1:
+            # ⚡ Parallel tokenization: identical output to serial (same static
+            # core runs in each worker); ~workers-x speedup on multi-core CPUs.
+            import multiprocessing as mp
+            try:
+                chunksize = max(16, len(conversations) // (workers * 8))
+                with mp.Pool(
+                    workers,
+                    initializer=_mp_worker_init,
+                    initargs=(self.tokenizer, self.max_seq_len),
+                ) as pool:
+                    results = pool.map(
+                        _mp_format_conversation, conversations, chunksize=chunksize
+                    )
+                for chunks in results:
+                    self.samples.extend(chunks)
+                print(f"   ⚡ Parallel tokenization: {workers} workers")
+            except Exception as e:
+                print(f"   ⚠️ Parallel tokenization failed ({type(e).__name__}: {e})")
+                print("   → falling back to serial")
+                for conv in tqdm(conversations):
+                    self.samples.extend(self._format_and_tokenize(conv))
+        else:
+            for conv in tqdm(conversations):
+                self.samples.extend(self._format_and_tokenize(conv))
+
+        if cache_path:
+            self.save(cache_path)
+
         print(f"\n✅ Dataset ready!")
         print(f"   → {len(self.samples)} training samples created")
     
@@ -605,3 +672,28 @@ class ConversationalDataset:
             "avg_len": sum(lengths) / len(lengths),
             "total_tokens": sum(lengths),
         }
+
+
+# ============================================================================
+# Multiprocessing tokenization workers (module-level → picklable)
+# ============================================================================
+
+_MP_STATE: Dict = {}
+
+
+def _mp_worker_init(tokenizer, max_seq_len):
+    """Runs once per worker process; injects shared (read-only) state."""
+    _MP_STATE["tokenizer"] = tokenizer
+    _MP_STATE["max_seq_len"] = max_seq_len
+
+
+def _mp_format_conversation(conversation):
+    """Format+tokenize one conversation in a worker process.
+
+    Uses the SAME static core as ConversationalDataset._format_and_tokenize,
+    so parallel output is byte-identical to serial tokenization.
+    """
+    from continuum.conversation.template import ChatTemplate
+    return ConversationalDataset._tokenize_conversation_core(
+        _MP_STATE["tokenizer"], ChatTemplate(), conversation, _MP_STATE["max_seq_len"]
+    )
