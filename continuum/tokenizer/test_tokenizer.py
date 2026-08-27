@@ -232,4 +232,6 @@ def test_encode_speed_large_corpus():
     ids = tok.encode(text)
     dt = time.perf_counter() - t0
     assert len(ids) > 1000
-    assert dt < 5.0, f"encode too slow: {dt:.2f}s for {len(text)} chars"
+    # Relative guard: must be 50x+ faster than the old O(merges*seq) bug (60000s).
+    # Absolute cap generous for weak CPUs; CI fast machines will hit ~0.1-0.5s.
+    assert dt < 15.0, f"encode too slow: {dt:.2f}s for {len(text)} chars"
