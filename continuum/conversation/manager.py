@@ -11,7 +11,7 @@ Integrates with:
 import os
 import json
 import torch
-from typing import Dict, List, Optional, Tuple, Generator
+from typing import Dict, Optional, Generator
 
 from continuum.conversation.template import ChatTemplate, Conversation, Message, Role
 from continuum.model.model import ContinuumModel

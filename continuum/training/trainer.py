@@ -17,7 +17,7 @@ import torch
 import torch.nn as nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from typing import Dict, Optional, Callable
+from typing import Dict, Optional
 from tqdm import tqdm
 
 from continuum.model.model import ContinuumModel

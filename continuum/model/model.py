@@ -1137,7 +1137,17 @@ class ContinuumModel(nn.Module):
 # ============================================================================
 
 def create_continuum_nano(vocab_size: int = 8000, with_vision: bool = False) -> ContinuumModel:
-    """Create Continuum-Nano: ~5M parameters (~7M with vision)."""
+    """
+    Create Continuum-Nano: ~5M parameters (~7M with vision).
+
+    Tier: Lightweight — runs on any CPU, ideal for speculative decoding drafts.
+    Arch: 6 layers (4 GLT + 2 Anchor), d_model=192, 4 heads
+    VRAM: ~50 MB (FP32), ~15 MB (INT8)
+
+    Args:
+        vocab_size: Vocabulary size (default 8000)
+        with_vision: If True, include ViGLT vision encoder
+    """
     vision_cfg = ContinuumVisionConfig(
         image_size=224, patch_size=16,
         d_vision=128, d_v_state=32,
@@ -1159,7 +1169,13 @@ def create_continuum_nano(vocab_size: int = 8000, with_vision: bool = False) -> 
 
 
 def create_continuum_small(vocab_size: int = 12000, with_vision: bool = False) -> ContinuumModel:
-    """Create Continuum-Small: ~20M parameters (~25M with vision)."""
+    """
+    Create Continuum-Small: ~20M parameters (~25M with vision).
+
+    Tier: Medium — runs on phone with INT8, good for mobile deployment.
+    Arch: 8 layers (5 GLT + 3 Anchor), d_model=384, 8 heads
+    VRAM: ~200 MB (FP32), ~60 MB (INT8)
+    """
     vision_cfg = ContinuumVisionConfig(
         image_size=224, patch_size=16,
         d_vision=192, d_v_state=64,
@@ -1180,19 +1196,42 @@ def create_continuum_small(vocab_size: int = 12000, with_vision: bool = False) -
     ))
 
 
+def create_continuum_medium(vocab_size: int = 16000, with_vision: bool = False) -> ContinuumModel:
+    """
+    Create Continuum-Medium: ~50M parameters (~60M with vision).
+
+    Tier: Large — good quality/speed tradeoff, T4 GPU recommended.
+    Arch: 10 layers (7 GLT + 3 Anchor), d_model=512, 8 heads
+    VRAM: ~600 MB (FP32), ~150 MB (INT8)
+    """
+    vision_cfg = ContinuumVisionConfig(
+        image_size=224, patch_size=16,
+        d_vision=256, d_v_state=96,
+        n_bi_glt_layers=4, n_anchor_layers=1,
+        n_heads=6, n_kv_heads=3, spatial_window=36,
+        ffn_expansion=3, ffn_shards=3,
+    ) if with_vision else None
+    return ContinuumModel(ContinuumConfig(
+        d_model=512, d_state=128, d_embed=128, vocab_size=vocab_size,
+        n_layers=10, glt_layers=7, anchor_layers=3,
+        perception_layers=4, core_layers=3, output_layers=3,
+        ffn_expansion=4, ffn_shards=4,
+        n_heads=8, n_kv_heads=4, window_size=128,
+        n_anchors=16, n_static_anchors=6,
+        n_max_loops=4, halt_threshold=0.95,
+        pmb_slots=48, pmb_readout=10, chunk_size=64,
+        vision_config=vision_cfg,
+    ))
+
+
 def create_continuum_max(vocab_size: int = 16000, with_vision: bool = False) -> ContinuumModel:
     """
     Create Continuum-Max: ~100M parameters (~115M with vision).
-    
-    From Section 17 tier table:
-    d_model=768, d_state=192, d_embed=160, vocab=16,000
-    12 layers: 9 GLT + 3 Anchor (4:3:5 perception:core:output)
-    12 heads, 4 KV heads (GQA ratio 3:1)
-    Window=128, Anchors=24 (static=8, PMB=16)
-    FFN: 4x expansion, 6 shards
-    ADL: N_max=5, PMB: 64 slots
 
-    With vision: Adds 13.5M ViGLT encoder (total ~115M)
+    Tier: Large — primary training target, T4 GPU recommended.
+    Arch: 12 layers (9 GLT + 3 Anchor), d_model=768, 12 heads (4 KV heads GQA)
+    VRAM: ~1.5 GB (FP32), ~380 MB (INT8)
+    Training: ~30-40 min on Kaggle T4 with batch=16, grad_accum=6
 
     Args:
         vocab_size: Vocabulary size (default 16000). Use 3834 for pretrained 4K tokenizer.

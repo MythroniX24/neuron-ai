@@ -16,7 +16,7 @@ import os
 import time
 import torch
 import torch.nn as nn
-from typing import Dict, List, Optional, Tuple, Generator
+from typing import Dict, List, Optional, Tuple
 
 
 # ============================================================================
