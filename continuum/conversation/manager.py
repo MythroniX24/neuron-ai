@@ -53,6 +53,7 @@ class ConversationManager:
         system_prompt: Optional[str] = None,
         device: str = "cpu",
         quantize: bool = False,
+        use_compile: bool = True,
         max_history_turns: int = 10,
         max_context_length: int = 2048,
     ):
@@ -77,6 +78,7 @@ class ConversationManager:
             tokenizer=tokenizer,
             device=device,
             quantize=quantize,
+            use_compile=use_compile,
         )
         
         # Current conversation

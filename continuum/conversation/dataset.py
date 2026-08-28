@@ -166,16 +166,17 @@ class ConversationalDataset:
         loader = dataset.get_dataloader(batch_size=8)
     """
     
-    def __init__(self, tokenizer, max_seq_len: int = 1024):
+    def __init__(self, tokenizer, max_seq_len: int = 1024, chat_template: Optional[ChatTemplate] = None):
         """
         Args:
             tokenizer: ContinuumTokenizer instance
             max_seq_len: Maximum sequence length after tokenization
+            chat_template: Custom ChatTemplate (default: add_generation_prompt=False)
         """
         self.tokenizer = tokenizer
         self.max_seq_len = max_seq_len
         self.samples: List[Tuple[List[int], List[int]]] = []  # (input_ids, labels)
-        self.chat_template = ChatTemplate(add_generation_prompt=False)
+        self.chat_template = chat_template or ChatTemplate(add_generation_prompt=False)
     
     def _format_and_tokenize(self, conversation: List[Dict], mask_non_assistant: bool = True) -> List[Tuple[List[int], List[int]]]:
         """

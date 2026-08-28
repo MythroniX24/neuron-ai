@@ -607,8 +607,11 @@ class ContinuumModel(nn.Module):
                 r_gate = torch.sigmoid(block.mixer.W_r(x_norm))
                 
                 # Parallel scan: O(log L) instead of O(L)
+                # ⚡ Chunked scan on CUDA: reduces peak VRAM from [B,L,D,D] to [B,32,D,D]
+                _scan_chunk = 32 if k.is_cuda and L > 32 else None
                 o, final_state = glt_parallel_forward_with_state(
-                    k, v, q, gamma, iota, r_gate, block.mixer.W_o.weight
+                    k, v, q, gamma, iota, r_gate, block.mixer.W_o.weight,
+                    chunk_size=_scan_chunk,
                 )  # o: [B, L, d_model], final_state: [B, D, D]
                 
                 x = residual + o
