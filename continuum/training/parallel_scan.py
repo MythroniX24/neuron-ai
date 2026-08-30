@@ -163,9 +163,16 @@ def _compute_chunked_outer_product_and_scan(
 
     Peak memory: [B, chunk_size, D, D] instead of [B, L, D, D]
 
+    ⚡ FIX: the scan itself now runs in FP32 — same stability guarantee as
+    the non-chunked path (which casts gamma/inputs to fp32). Previously the
+    chunked path scanned in the INPUT dtype, i.e. fp16 under AMP, where
+    gamma^C products across a chunk can silently under/overflow and corrupt
+    the recurrence on exactly the long CUDA training runs that use this path.
+
     Args:
         k, v, q, gamma, iota: [B, L, D]
-        chunk_size: Number of positions per chunk (must be power of 2 for scan)
+        chunk_size: Number of positions per chunk (any size — Kogge-Stone
+                    handles arbitrary lengths via step-doubling)
 
     Returns:
         outputs: [B, L, d_state] (h = states @ q)
@@ -173,11 +180,8 @@ def _compute_chunked_outer_product_and_scan(
     """
     B, L, D = k.shape
 
-    # Round chunk_size up to next power of 2 (required for Kogge-Stone)
-    cs = 1
-    while cs < chunk_size:
-        cs *= 2
-    chunk_size = cs
+    # NOTE: Kogge-Stone covers all prefix distances in ceil(log2 L) rounds for
+    # ANY L — the old power-of-2 padding only wasted up to 2x compute.
 
     # Pad sequence to multiple of chunk_size
     n_chunks = (L + chunk_size - 1) // chunk_size
@@ -215,19 +219,24 @@ def _compute_chunked_outer_product_and_scan(
         outer_c = k_c.unsqueeze(-1) @ v_c.unsqueeze(-2)
         gated_input_c = iota_c.unsqueeze(-1) * outer_c
 
-        # Scan this chunk with initial state from previous chunk
+        # ⚡ FIX: scan in FP32 (see docstring). The carried state stays fp32
+        # across chunks; only the readout is cast back to the input dtype.
+        scan_dtype = torch.float32
         chunk_states, running_state = _chunked_scan_with_initial_state(
-            gamma_c, gated_input_c, running_state
-        )  # chunk_states: [B, C, D, D], running_state: [B, D, D]
+            gamma_c.to(scan_dtype),
+            gated_input_c.to(scan_dtype),
+            running_state.to(scan_dtype) if running_state is not None else None,
+        )  # chunk_states: [B, C, D, D] fp32, running_state: [B, D, D] fp32
 
-        # Compute output: h = states @ q
-        h_c = (chunk_states @ q_c.unsqueeze(-1)).squeeze(-1)  # [B, C, D]
+        # Compute output: h = states @ q (readout in input dtype — single
+        # small GEMM, no accumulation risk)
+        h_c = (chunk_states.to(k.dtype) @ q_c.unsqueeze(-1)).squeeze(-1)  # [B, C, D]
         all_outputs.append(h_c)
 
     # Remove padding from output
     outputs = torch.cat(all_outputs, dim=1)[:, :L, :]  # [B, L, D]
 
-    return outputs, running_state
+    return outputs, running_state.to(k.dtype)
 
 
 def glt_parallel_forward(

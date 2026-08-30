@@ -9,6 +9,7 @@ import os
 import sys
 import json
 import time
+import threading
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
@@ -22,6 +23,24 @@ CORS(app)
 _inference_engine = None
 _tokenizer = None
 _model_loaded = False
+
+# ⚡ FIX: the engine holds ONE mutable conversation state (glt_states, tokens).
+# Two concurrent requests interleave their forwards and corrupt each other's
+# context — generation must be serialized.
+_engine_lock = threading.Lock()
+
+
+def _safe_state_path(raw: str) -> str:
+    """Clamp save/resume paths into checkpoints/ — the endpoint used to accept
+    arbitrary paths ("../../etc/x" overwrote files anywhere on disk)."""
+    base = os.path.normpath(
+        os.path.join(os.path.dirname(__file__), "..", "..", "checkpoints")
+    )
+    name = os.path.basename(raw or "conversation_state.pt") or "conversation_state.pt"
+    if not name.endswith(".pt"):
+        name += ".pt"
+    os.makedirs(base, exist_ok=True)
+    return os.path.join(base, name)
 
 
 def _find_checkpoint():
@@ -163,14 +182,15 @@ def chat():
         # Demo mode
         response_text = _demo_response(message)
     else:
-        response_text = engine.generate(
-            message,
-            max_new_tokens=max_tokens,
-            temperature=temperature,
-            top_k=top_k,
-            top_p=top_p,
-            stream=False,
-        )
+        with _engine_lock:
+            response_text = engine.generate(
+                message,
+                max_new_tokens=max_tokens,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                stream=False,
+            )
 
     return jsonify({
         "response": response_text,
@@ -202,15 +222,16 @@ def chat_stream():
                 time.sleep(0.05)
             yield f"data: {json.dumps({'token': '', 'done': True})}\n\n"
         else:
-            for token in engine.generate(
-                message,
-                max_new_tokens=max_tokens,
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-                stream=True,
-            ):
-                yield f"data: {json.dumps({'token': token, 'done': False})}\n\n"
+            with _engine_lock:
+                for token in engine.generate(
+                    message,
+                    max_new_tokens=max_tokens,
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                    stream=True,
+                ):
+                    yield f"data: {json.dumps({'token': token, 'done': False})}\n\n"
             yield f"data: {json.dumps({'token': '', 'done': True})}\n\n"
 
     return Response(
@@ -238,7 +259,7 @@ def new_conversation():
 def save_conversation():
     """Save current conversation state."""
     data = request.get_json()
-    path = data.get("path", "conversation_state.pt")
+    path = _safe_state_path(data.get("path", "conversation_state.pt"))
 
     engine, _ = get_model()
     if engine:
@@ -252,7 +273,7 @@ def save_conversation():
 def resume_conversation():
     """Resume conversation from saved state."""
     data = request.get_json()
-    path = data.get("path", "conversation_state.pt")
+    path = _safe_state_path(data.get("path", "conversation_state.pt"))
 
     engine, _ = get_model()
     if engine:

@@ -18,6 +18,13 @@ import torch
 import torch.nn as nn
 from typing import Dict, List, Optional, Tuple
 
+# Chat-template markers used as generation STOP sequences. The model ends its
+# turns with the literal '<|end|>' TEXT (a fixed BPE token sequence), not the
+# <eos> special id — so id-level stop detection is required for chat.
+from continuum.conversation.template import ChatTemplate as _ChatTemplate
+
+_CHAT_MARKERS = _ChatTemplate.SPECIAL_TOKENS
+
 
 # ============================================================================
 # QuantizedLinear — Cached INT8 Dequantization
@@ -702,6 +709,35 @@ class ContinuumSpeculativeDecoder:
 
 
 # ============================================================================
+# INT8 helper (module-level so checkpoints/UI can rebuild a quantized
+# skeleton before load_state_dict)
+# ============================================================================
+
+def apply_int8_quantization(model) -> None:
+    """Replace large nn.Linear layers with QuantizedLinear (in place).
+
+    ⚡ FIX: extracted from ContinuumInference._apply_quantization so INT8
+    runtime exports can actually be loaded back: build a fresh model, quantize
+    it with THIS function, then load_state_dict — the QuantizedLinear buffer
+    keys then match the checkpoint exactly (previously the UI rejected INT8
+    exports and silently fell back to an UNTRAINED model).
+    """
+    from continuum.model.attention import AnchorAttention
+
+    def _quantize_module(module):
+        for name, child in module.named_children():
+            if isinstance(child, nn.Linear) and child.in_features > 64:
+                setattr(module, name, QuantizedLinear(child))
+                # Update format flag so AnchorAttention._get_kv_weights() routes correctly
+                if isinstance(module, AnchorAttention) and name == "W_qkv":
+                    module._w_qkv_format = "int8"
+            else:
+                _quantize_module(child)
+
+    _quantize_module(model)
+
+
+# ============================================================================
 # ContinuumInference — Extreme CPU Optimized
 # ============================================================================
 
@@ -727,6 +763,7 @@ class ContinuumInference:
         quantize: bool = True,
         use_compile: bool = True,
         use_max_autotune: bool = True,
+        use_adl: bool = False,
     ):
         # ⚡ Phase 8: Auto-detect GPU if device="auto"
         if device == "auto":
@@ -750,6 +787,19 @@ class ContinuumInference:
         self.quantize = quantize
         self.use_compile = use_compile
         self.use_max_autotune = use_max_autotune
+        # ⚡ ADL policy: OFF by default so inference matches the 1-loop core
+        # used in training. Enable only for checkpoints trained with periodic
+        # full-ADL steps (ContinuumTrainer(adl_train_every=...)) — otherwise
+        # the untrained halting head just burns extra loops per token.
+        self.use_adl = use_adl
+
+        # ⚡ Precompute token-id stop sequences for the chat markers.
+        self._stop_sequences: List[List[int]] = []
+        if tokenizer is not None:
+            for marker in _CHAT_MARKERS:
+                ids = tokenizer.encode(marker)
+                if ids:
+                    self._stop_sequences.append(ids)
 
         model.to(device).to(dtype)
         model.eval()
@@ -767,6 +817,9 @@ class ContinuumInference:
         # torch.compile the model forward with max-autotune
         self._compiled_forward = None
         compile_mode = _get_compile_mode(device, use_max_autotune)
+        # ⚡ FIX: warmup ids must fit the vocab (randint(0, 100) crashed for
+        # vocab_size < 100).
+        vocab_hi = max(4, min(100, getattr(self.model.config, "vocab_size", 16000)))
         if use_compile and _HAS_COMPILE:
             try:
                 self._compiled_forward = torch.compile(
@@ -774,7 +827,7 @@ class ContinuumInference:
                 )
                 # Warm up compilation
                 t0 = time.time()
-                dummy = torch.randint(0, 100, (1, 4), device=device)
+                dummy = torch.randint(0, vocab_hi, (1, 4), device=device)
                 _ = self._compiled_forward(dummy)
                 elapsed = time.time() - t0
                 print(f"  torch.compile: model compiled ({compile_mode} mode, {elapsed:.1f}s warmup)")
@@ -786,7 +839,7 @@ class ContinuumInference:
                         self._compiled_forward = torch.compile(
                             model.forward, fullgraph=False, mode=compile_mode
                         )
-                        dummy = torch.randint(0, 100, (1, 4), device=device)
+                        dummy = torch.randint(0, vocab_hi, (1, 4), device=device)
                         _ = self._compiled_forward(dummy)
                         print(f"  torch.compile: model compiled ({compile_mode} mode — max-autotune failed)")
                     except Exception as e2:
@@ -803,17 +856,7 @@ class ContinuumInference:
 
     def _apply_quantization(self):
         """Apply INT8 quantization to all linear layers (with cached weights)."""
-        from continuum.model.attention import AnchorAttention
-        def _quantize_module(module):
-            for name, child in module.named_children():
-                if isinstance(child, nn.Linear) and child.in_features > 64:
-                    setattr(module, name, QuantizedLinear(child))
-                    # Update format flag so AnchorAttention._get_kv_weights() routes correctly
-                    if isinstance(module, AnchorAttention) and name == "W_qkv":
-                        module._w_qkv_format = "int8"
-                else:
-                    _quantize_module(child)
-        _quantize_module(self.model)
+        apply_int8_quantization(self.model)
 
     def _warmup_quantized(self):
         """Run one dummy forward to populate dequantization caches."""
@@ -862,6 +905,24 @@ class ContinuumInference:
         recent = torch.tensor([recent_ids], device=self.device, dtype=torch.long)
         summary = self.model.embedding.embed(recent).mean(dim=1)  # [1, d_model]
         self.model.pmb.write(summary)
+
+    def _hit_stop_sequence(self, gen_ids: List[int]) -> bool:
+        """True if the generated id list now ENDS with any stop-marker sequence
+        (e.g. the '<|end|>' token sequence)."""
+        for seq in self._stop_sequences:
+            if seq and len(gen_ids) >= len(seq) and gen_ids[-len(seq):] == seq:
+                return True
+        return False
+
+    @staticmethod
+    def _truncate_at_marker(text: str) -> str:
+        """Cut decoded text at the earliest chat-template marker."""
+        cut = -1
+        for marker in _CHAT_MARKERS:
+            idx = text.find(marker)
+            if idx != -1 and (cut == -1 or idx < cut):
+                cut = idx
+        return text[:cut] if cut != -1 else text
 
     def resume_conversation(self, state_path: str) -> str:
         """Resume conversation from saved state."""
@@ -924,9 +985,12 @@ class ContinuumInference:
         if self.tokenizer is None:
             raise ValueError("Tokenizer required for text generation")
 
-        # Encode prompt
+        # Encode prompt — ⚡ FIX: prepend <bos> only on a fresh conversation.
+        # Incremental turns used to inject a spurious mid-conversation <bos>
+        # that the model never saw during training.
+        add_bos = len(self.conversation_tokens) == 0
         prompt_ids = self.tokenizer.encode_with_special(
-            prompt, add_bos=True, add_eos=False
+            prompt, add_bos=add_bos, add_eos=False
         )
         prompt_tensor = torch.tensor([prompt_ids], device=self.device)
         self.conversation_tokens.extend(prompt_ids)
@@ -1000,15 +1064,23 @@ class ContinuumInference:
             if token_id_val == eos_id:
                 break
 
+            # ⚡ FIX: chat-marker stop detection. The model ends its turns with
+            # the literal '<|end|>' TEXT (a fixed BPE token sequence), not the
+            # <eos> special id — without this check generation ran past the
+            # turn boundary and emitted the next turn's template markers.
+            if self._hit_stop_sequence(self.conversation_tokens):
+                break
+
             # Forward next single token through compiled model
             result = forward_fn(next_token_tensor, self.glt_states, self.window_caches)
             self.glt_states = result["glt_states"]
             self.window_caches = result["window_caches"]
             next_logits = result["logits"][:, -1, :]
 
-        # Decode only the generated tokens
+        # Decode only the generated tokens, cut at the earliest chat marker so
+        # the marker text itself never reaches the caller.
         tokens_to_decode = generated_buf[:actual_count].tolist()
-        return self.tokenizer.decode(tokens_to_decode)
+        return self._truncate_at_marker(self.tokenizer.decode(tokens_to_decode))
 
     @torch.inference_mode()
     def _stream_generate(
@@ -1083,6 +1155,10 @@ class ContinuumInference:
             yield self.tokenizer.decode([int(token_id_val)])
 
             if token_id_val == eos_id:
+                break
+
+            # ⚡ FIX: chat-marker stop detection (see _generate_text).
+            if self._hit_stop_sequence(self.conversation_tokens):
                 break
 
             result = forward_fn(next_token_tensor, self.glt_states, self.window_caches)

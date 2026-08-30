@@ -120,13 +120,19 @@ class AnchorAttention(nn.Module):
         self._init_alibi_slopes()
 
         # Precompute full ALiBi bias for the window (never changes)
-        # Shape: [1, 1, n_heads, window_size] — broadcasts correctly with scores [B, L, n_heads, T]
-        distances = torch.arange(self.window_size).float()
-        alibi_full = -self.alibi_slopes.view(self.n_heads, 1) * distances.view(1, -1)
-        # ⚡ Shape: [1, n_heads, 1, window_size] — matches alibi_attn_mask layout [1, n_heads, 1, T]
-        # This allows direct slice assignment without broadcasting errors.
-        # (was [1, 1, n_heads, ws] — caused RuntimeError when n_heads != 1)
-        # Uses .reshape() instead of .view() for PyTorch 2.10+ buffer shape normalization robustness.
+        # ⚡ FIX: the bias now encodes TRUE relative distance. The sliding
+        # window cache keeps the NEWEST token in the LAST slot (slot s holds a
+        # token that is (window_size - s) positions behind the current one),
+        # so the penalty for slot s is -slope * (window_size - s): recent
+        # tokens get a small penalty, the oldest slots the largest. Empty
+        # slots at the front of a partially-filled window are zero K/V rows
+        # sitting on the most-negative bias, so their softmax mass becomes
+        # negligible instead of soaking up attention weight.
+        # Shape: [1, n_heads, 1, window_size] — matches alibi_attn_mask layout
+        # [1, n_heads, 1, T]; allows direct slice assignment without
+        # broadcasting errors. Uses .reshape() for PyTorch 2.10+ robustness.
+        slots = torch.arange(self.window_size).float()
+        alibi_full = -self.alibi_slopes.view(self.n_heads, 1) * (self.window_size - slots).view(1, -1)
         self.register_buffer("alibi_bias_full", alibi_full.reshape(1, self.n_heads, 1, self.window_size))
 
         # Runtime flex policy: flex_attention is only a win when fused by
@@ -275,8 +281,12 @@ class AnchorAttention(nn.Module):
 
         Mathematically equivalent to the SDPA path:
           - Anchors (kv_idx < n_anchors): score unchanged
-          - Window: score -= alibi_slopes[h] * window_pos
-          - Causal: mask when window_pos >= q_idx
+          - Window: score -= alibi_slopes[h] * (q_idx - window_pos)
+            (TRUE relative ALiBi distance — matches the flipped slot bias
+            used by sequential decode and the SDPA parallel path)
+          - Causal: mask when window_pos > q_idx — self-attention
+            (window_pos == q_idx) is ALLOWED, matching the SDPA path's
+            torch.triu(..., diagonal=1)
         """
         alibi_slopes = self.alibi_slopes  # captured as lifted parameter
 
@@ -288,9 +298,12 @@ class AnchorAttention(nn.Module):
             def score_mod(score, b, h, q_idx, kv_idx):
                 is_anchor = kv_idx < n_anchors
                 window_pos = kv_idx - n_anchors
-                biased = score - alibi_slopes[h] * window_pos
+                # Relative ALiBi: penalty grows with TRUE distance (i - j).
+                # Self-attention (window_pos == q_idx) is allowed so this
+                # matches the SDPA path's triu(diagonal=1) causal mask.
+                biased = score - alibi_slopes[h] * (q_idx - window_pos)
                 masked = torch.where(
-                    window_pos >= q_idx,
+                    window_pos > q_idx,
                     score.new_full((), float("-inf")),
                     biased,
                 )
@@ -428,32 +441,59 @@ class AnchorAttention(nn.Module):
             # Before: 4 separate tensor allocations (anchor_bias, full_bias, causal_float, ones).
             # After: 1 pre-allocated tensor + 1 triu call. Saves 2-3 allocs per anchor forward.
             ws_len = total_kv_len - anchor_count
+            slopes = self.alibi_slopes.to(device=x.device, dtype=q.dtype)
 
-            # ALiBi bias: zeros for anchors + learned slopes for window
-            # Shape: [1, n_heads, 1, total_kv_len] — broadcasts with Q@K^T [B, n_heads, L, T]
-            alibi_attn_mask = torch.zeros(1, self.n_heads, 1, total_kv_len, device=x.device, dtype=q.dtype)
-            if ws_len > 0:
-                if ws_len <= self.window_size:
-                    alibi_attn_mask[:, :, :, anchor_count:] = \
-                        self.alibi_bias_full.to(device=x.device, dtype=q.dtype)[:, :, :, :ws_len]
-                else:
-                    # ⚡ Parallel-training path can pass more window keys than the
-                    # persistent cache size (current chunk as K/V). Build the bias
-                    # dynamically so shapes always line up.
-                    distances = torch.arange(ws_len, device=x.device, dtype=q.dtype)
-                    dyn = -self.alibi_slopes.to(device=x.device, dtype=q.dtype).view(self.n_heads, 1) * distances.view(1, -1)
-                    alibi_attn_mask[:, :, :, anchor_count:] = dyn.reshape(1, self.n_heads, 1, ws_len)
-
-            if causal_mask and L > 1:
-                # Add causal mask: -inf for window positions where kv_pos >= q_pos
-                # Shape: [L, total_kv_len] — broadcasts with alibi_attn_mask
-                causal_mask_tensor = torch.zeros(L, total_kv_len, device=x.device, dtype=q.dtype)
+            if causal_mask and L > 1 and ws_len == L:
+                # ⚡ FIX: TRUE relative ALiBi for the parallel (teacher-forced)
+                # path. The window keys here are exactly the current chunk
+                # (key j sits at chunk position j), so query i must receive a
+                # penalty of -slope*(i - j) — exactly what sequential decode
+                # computes from the flipped slot bias. Training and inference
+                # attention semantics are now equivalent, not just
+                # shape-compatible. Mask [1, H, L, T] broadcasts with scores
+                # [B, H, L, T] over the batch dim.
+                pos = torch.arange(L, device=x.device, dtype=q.dtype)
+                rel_dist = (pos.unsqueeze(0) - pos.unsqueeze(1)).clamp_min(0)  # [L, L] dist[i,j] = i-j
+                alibi_attn_mask = torch.zeros(
+                    1, self.n_heads, L, total_kv_len, device=x.device, dtype=q.dtype
+                )
+                alibi_attn_mask[:, :, :, anchor_count:] = \
+                    -slopes.view(self.n_heads, 1, 1) * rel_dist.unsqueeze(0)
+                # Causal: mask strictly-future window keys (self-attention allowed,
+                # matching the flex score_mod and sequential decode semantics)
+                alibi_attn_mask[:, :, :, anchor_count:] += torch.triu(
+                    torch.full((L, L), float('-inf'), device=x.device, dtype=q.dtype),
+                    diagonal=1
+                )
+            else:
+                # Single-token decode (L == 1, causal_mask=False): the window
+                # cache is a sliding buffer whose LAST slot is the newest
+                # token, so alibi_bias_full's slot→distance mapping yields
+                # exact relative distances — including for partially-filled
+                # windows, where the empty front slots (zero K/V rows) land on
+                # the most-negative bias and contribute ~no softmax mass.
+                alibi_attn_mask = torch.zeros(1, self.n_heads, 1, total_kv_len, device=x.device, dtype=q.dtype)
                 if ws_len > 0:
+                    if ws_len <= self.window_size:
+                        alibi_attn_mask[:, :, :, anchor_count:] = \
+                            self.alibi_bias_full.to(device=x.device, dtype=q.dtype)[:, :, :, :ws_len]
+                    else:
+                        # Defensive: more window keys than the persistent cache
+                        # size (no current caller). Keep the slot→distance
+                        # mapping so shapes and recency ordering still line up.
+                        distances = torch.arange(ws_len, device=x.device, dtype=q.dtype)
+                        dyn = -slopes.view(self.n_heads, 1) * (ws_len - distances).view(1, -1)
+                        alibi_attn_mask[:, :, :, anchor_count:] = dyn.reshape(1, self.n_heads, 1, ws_len)
+
+                if causal_mask and L > 1:
+                    # Causal with ws_len != L (no current caller): keep strict
+                    # causal masking; bias remains slot-based.
+                    causal_mask_tensor = torch.zeros(L, total_kv_len, device=x.device, dtype=q.dtype)
                     causal_mask_tensor[:, anchor_count:] = torch.triu(
                         torch.full((L, ws_len), float('-inf'), device=x.device, dtype=q.dtype),
                         diagonal=1
                     )
-                alibi_attn_mask = alibi_attn_mask + causal_mask_tensor.unsqueeze(0)
+                    alibi_attn_mask = alibi_attn_mask + causal_mask_tensor.unsqueeze(0)
 
             output = F.scaled_dot_product_attention(
                 q.transpose(1, 2),

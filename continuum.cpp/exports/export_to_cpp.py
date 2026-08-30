@@ -206,54 +206,78 @@ def export_model(model, output_path: str, quantize: str = "fp32"):
 def export_tokenizer(tokenizer, output_path: str):
     """Export BPE tokenizer to compact binary format for C++ engine.
 
+    ⚡ FIX: this function previously read attributes ContinuumTokenizer does
+    not have (`vocab`, `eos_token_id`, ...) so it exported an EMPTY vocab,
+    and crashed on merge keys (raw `bytes` tuples) by calling .encode() on
+    them. Now it reads the real attributes:
+      - vocab  ← token_to_bytes (id → raw bytes; byte-level BPE tokens are
+                 arbitrary byte strings, so we write RAW BYTES — never
+                 re-encode through str)
+      - merges ← (bytes, bytes) → new_id
+      - special ← pad_id / bos_id / eos_id
+
     Format:
         uint32_t magic (0x54504F42 = 'BPTO')
         uint32_t version (1)
         uint32_t vocab_size
         uint32_t num_merges
         uint32_t num_special_tokens
-        For each vocab entry: uint16_t len + UTF-8 bytes
+        For each vocab entry: uint16_t len + bytes
         For each merge: uint32_t rank + uint16_t len_a + bytes_a + uint16_t len_b + bytes_b
         For each special token: uint32_t id + uint16_t len + bytes
     """
     import struct
 
-    vocab = tokenizer.vocab if hasattr(tokenizer, 'vocab') else {}
-    merges = tokenizer.merges if hasattr(tokenizer, 'merges') else []
+    def _as_bytes(x) -> bytes:
+        return x if isinstance(x, bytes) else str(x).encode("utf-8")
 
-    # Build vocab list indexed by token ID
-    if isinstance(vocab, dict):
-        vocab_list = [None] * len(vocab)
-        for tok, idx in vocab.items():
-            if idx < len(vocab_list):
-                vocab_list[idx] = tok
-        vocab_list = [v if v else f"<unused_{i}>" for i, v in enumerate(vocab_list)]
+    # Build vocab list indexed by token ID from the real id→bytes table.
+    token_to_bytes = getattr(tokenizer, "token_to_bytes", None)
+    if isinstance(token_to_bytes, dict) and token_to_bytes:
+        max_id = max(token_to_bytes.keys())
+        vocab_list: list = [None] * (max_id + 1)
+        for tid, tok_bytes in token_to_bytes.items():
+            vocab_list[tid] = _as_bytes(tok_bytes)
+        vocab_list = [v if v is not None else f"<unused_{i}>".encode()
+                      for i, v in enumerate(vocab_list)]
     else:
-        vocab_list = list(vocab)
+        # Legacy str-vocab fallback (other tokenizer implementations)
+        vocab = tokenizer.vocab if hasattr(tokenizer, "vocab") else {}
+        if isinstance(vocab, dict):
+            tmp = [None] * len(vocab)
+            for tok, idx in vocab.items():
+                if idx < len(tmp):
+                    tmp[idx] = _as_bytes(tok)
+            vocab_list = [v if v is not None else f"<unused_{i}>".encode()
+                          for i, v in enumerate(tmp)]
+        else:
+            vocab_list = [_as_bytes(v) for v in vocab]
 
-    # Build merges list (pairs of strings)
+    # Build merges list (pairs of raw bytes, in rank order)
+    merges = getattr(tokenizer, "merges", {}) or {}
     merge_pairs = []
-    if hasattr(merges, 'items'):
+    if hasattr(merges, "items"):
         for pair, rank in sorted(merges.items(), key=lambda x: x[1]):
-            if isinstance(pair, tuple):
-                merge_pairs.append(pair)
-            else:
-                merge_pairs.append((pair[:len(pair)//2], pair[len(pair)//2:]))
+            a, b = pair
+            merge_pairs.append((_as_bytes(a), _as_bytes(b)))
     else:
         for m in merges:
             if isinstance(m, (tuple, list)) and len(m) == 2:
-                merge_pairs.append((str(m[0]), str(m[1])))
+                merge_pairs.append((_as_bytes(m[0]), _as_bytes(m[1])))
 
-    # Special tokens
+    # Special tokens — the REAL attribute names on ContinuumTokenizer
     special_tokens = {}
-    if hasattr(tokenizer, 'eos_token_id') and tokenizer.eos_token_id is not None:
-        special_tokens["<|eos|>"] = tokenizer.eos_token_id
-    if hasattr(tokenizer, 'user_token_id') and tokenizer.user_token_id is not None:
-        special_tokens["<|user|>"] = tokenizer.user_token_id
-    if hasattr(tokenizer, 'assistant_token_id') and tokenizer.assistant_token_id is not None:
-        special_tokens["<|assistant|>"] = tokenizer.assistant_token_id
-    if hasattr(tokenizer, 'system_token_id') and tokenizer.system_token_id is not None:
-        special_tokens["<|system|>"] = tokenizer.system_token_id
+    for attr, name in (("pad_id", "<pad>"), ("bos_id", "<bos>"), ("eos_id", "<eos>")):
+        tid = getattr(tokenizer, attr, None)
+        if tid is not None:
+            special_tokens[name] = int(tid)
+    # Optional chat-template specials (only present on some tokenizers)
+    for attr, name in (("user_token_id", "<|user|>"),
+                       ("assistant_token_id", "<|assistant|>"),
+                       ("system_token_id", "<|system|>")):
+        tid = getattr(tokenizer, attr, None)
+        if tid is not None:
+            special_tokens[name] = int(tid)
 
     with open(output_path, "wb") as f:
         f.write(struct.pack("<I", 0x54504F42))  # magic 'BPTO'
@@ -263,15 +287,12 @@ def export_tokenizer(tokenizer, output_path: str):
         f.write(struct.pack("<I", len(special_tokens)))
 
         # Vocab entries
-        for tok_str in vocab_list:
-            tok_bytes = tok_str.encode('utf-8')
+        for tok_bytes in vocab_list:
             f.write(struct.pack("<H", len(tok_bytes)))
             f.write(tok_bytes)
 
         # Merges
-        for rank, (a, b) in enumerate(merge_pairs):
-            a_bytes = a.encode('utf-8')
-            b_bytes = b.encode('utf-8')
+        for rank, (a_bytes, b_bytes) in enumerate(merge_pairs):
             f.write(struct.pack("<I", rank))
             f.write(struct.pack("<H", len(a_bytes)))
             f.write(a_bytes)
@@ -324,7 +345,9 @@ if __name__ == "__main__":
     if args.tokenizer:
         os.makedirs(os.path.dirname(args.tokenizer_output), exist_ok=True)
         try:
-            from continuum.tokenizer.bpe import BPETokenizer as PyBPE
+            # ⚡ FIX: the class is ContinuumTokenizer (BPETokenizer never
+            # existed — this import always failed and the export was skipped).
+            from continuum.tokenizer.bpe import ContinuumTokenizer as PyBPE
             tok = PyBPE.load(args.tokenizer)
             export_tokenizer(tok, args.tokenizer_output)
         except Exception as e:

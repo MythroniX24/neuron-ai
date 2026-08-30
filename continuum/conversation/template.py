@@ -121,11 +121,19 @@ class ChatTemplate:
     def parse_response(self, response: str) -> str:
         """
         Parse model response to extract just the assistant's message.
-        
-        Removes any special tokens that might have been generated.
+
+        ⚡ FIX: cut at the FIRST special token rather than stripping all of
+        them. Stripping every marker kept any spurious text the model emitted
+        after the '<|end|>' boundary (e.g. the next turn's user/system
+        template markers) as if it were part of the assistant's reply.
         """
+        cut = -1
         for token in self.SPECIAL_TOKENS:
-            response = response.replace(token, "")
+            idx = response.find(token)
+            if idx != -1 and (cut == -1 or idx < cut):
+                cut = idx
+        if cut != -1:
+            response = response[:cut]
         return response.strip()
     
     def count_tokens_estimate(self, text: str) -> int:

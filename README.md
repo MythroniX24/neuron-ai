@@ -183,7 +183,11 @@ cd continuum && python -m pytest \
   model/test_vision.py tokenizer/test_tokenizer.py -q && cd ..
 
 # Tiny local training smoke-run (CPU — real training belongs on Kaggle/Colab)
-python3 continuum/run.py train --data my_data.jsonl --epochs 1 --batch_size 4
+# ⚠️ run.py train expects PLAIN TEXT (one text per line). For JSONL
+# {"instruction":..., "response":...} use the ConversationalDataset API
+# (see Custom Dataset Training below) or pre-convert:
+#   python -c "import json,sys; [print(json.loads(l)['instruction']+'\n'+json.loads(l)['response']) for l in open(sys.argv[1]) if l.strip()]" my_data.jsonl > corpus.txt
+python3 continuum/run.py train --data my_data.txt --epochs 1 --batch_size 4
 ```
 
 > 💡 **Weak CPU?** Export `OMP_NUM_THREADS=1` before running tests — on 2-core machines this roughly halves wall-clock time.
@@ -361,11 +365,12 @@ dataset = ConversationalDataset(
 )
 ```
 
-Or straight from the CLI:
+Or straight from the CLI (⚠️ `run.py train` expects PLAIN TEXT lines; for
+Alpaca-style JSONL use the ConversationalDataset API above, or convert):
 
 ```bash
 python3 continuum/run.py train \
-  --data my_data.jsonl \
+  --data my_data.txt \
   --epochs 10 --batch_size 8 --lr 3e-4 \
   --seq_len_start 32 --seq_len_end 512 \
   --checkpoint_dir checkpoints

@@ -418,7 +418,20 @@ class ContinuumModel(nn.Module):
                     window_caches[window_idx] = (wk, wv)
                     window_idx += 1
             n_loops = 1
-            ponder_cost = torch.tensor(0.0, device=x.device)
+            if self.training:
+                # ⚡ FIX: give the halting head a gradient even on the 1-loop
+                # fast path. Previously ponder_cost was a constant 0.0 here,
+                # so the halting head received NO gradient during training
+                # while inference still consulted it — ADL shipped untrained.
+                # The ponder cost penalizes CONTINUING: for a single pass the
+                # expected extra loops ≈ (1 - p), so the head is pushed toward
+                # p → 1 ("halt after one pass"). Full-ADL training steps (see
+                # ContinuumTrainer.adl_train_every) then provide the CE
+                # counter-pressure when looping genuinely reduces loss.
+                p1 = self.halting_head(x)  # [B, 1]
+                ponder_cost = 0.01 * (1.0 - p1).mean()
+            else:
+                ponder_cost = torch.tensor(0.0, device=x.device)
             return x, glt_states, window_caches, n_loops, ponder_cost
 
         # Full ADL path (inference) — looping with halting
@@ -436,6 +449,17 @@ class ContinuumModel(nn.Module):
         ]
         last_anchor_inputs = {}
 
+        # ⚡ FIX: persist the core GLT states as of the FIRST pass. Training
+        # runs the core exactly once per token, so the recurrent memory stream
+        # must advance exactly once per token at inference too — previously N
+        # loops fast-forwarded the GLT state N times and every subsequent
+        # token conditioned on a state the model had never been trained on.
+        # The loop itself still uses the evolving states for its iterative
+        # computation; only what we CARRY FORWARD is rolled back.
+        core_state_slice = range(len(self.perception_blocks),
+                                 len(self.perception_blocks) + len(self.core_blocks))
+        first_pass_states = None
+
         for loop in range(n_loops_max):
             # Run core blocks (window caches intentionally NOT mutated here)
             anchor_j = 0
@@ -449,6 +473,12 @@ class ContinuumModel(nn.Module):
                     x, block_input = block.forward_anchor(x, wk, wv, pmb_readouts)
                     last_anchor_inputs[anchor_j] = block_input
                     anchor_j += 1
+
+            if loop == 0:
+                first_pass_states = [
+                    glt_states[i].clone() if glt_states[i] is not None else None
+                    for i in core_state_slice
+                ]
 
             # Reset indices for next loop
             state_idx = len(self.perception_blocks)
@@ -477,6 +507,12 @@ class ContinuumModel(nn.Module):
                 wk_new, wv_new = wk_saved, wv_saved
             window_caches[core_window_start + a_j] = (wk_new, wv_new)
 
+        # ⚡ FIX (ADL): restore first-pass GLT states — exactly one recurrent
+        # state advance per generated token, matching the training dynamics.
+        if first_pass_states is not None:
+            for offset, i in enumerate(core_state_slice):
+                glt_states[i] = first_pass_states[offset]
+
         # ACT-style weighted combination
         n_loops = len(halting_probs)
         if n_loops > 1:
@@ -488,15 +524,24 @@ class ContinuumModel(nn.Module):
             probs_normalized[-1] = remainder
 
             x_combined = torch.zeros_like(x)
-            total_weight = 0.0
-            for i, (state_i, prob_i) in enumerate(zip(entry_states, probs_normalized)):
+            total_weight = torch.zeros_like(probs_normalized[0])
+            for state_i, prob_i in zip(entry_states, probs_normalized):
                 x_combined = x_combined + prob_i * state_i
                 total_weight = total_weight + prob_i
-            x = x_combined / total_weight.clamp(min=1e-8)
+            # ⚡ FIX: guard against vanishing weight mass (halting head pushed
+            # toward 0) — average the entries instead of exploding through a
+            # 1e-8 division.
+            if torch.all(total_weight < 1e-4):
+                x = torch.stack(entry_states, dim=0).mean(dim=0)
+            else:
+                x = x_combined / total_weight.clamp(min=1e-8)
 
             if self.training:
-                ponder_cost = sum(p.mean() for p in halting_probs)
-                ponder_cost = 0.01 * ponder_cost
+                # ⚡ FIX: the ponder cost must penalize LOOPING (expected extra
+                # compute). It previously summed the halting probabilities —
+                # which REWARDS never halting, the exact opposite of the
+                # intended ACT pressure.
+                ponder_cost = 0.01 * sum((1.0 - p).mean() for p in halting_probs)
             else:
                 ponder_cost = torch.tensor(0.0, device=x.device)
         else:
@@ -614,6 +659,12 @@ class ContinuumModel(nn.Module):
                     chunk_size=_scan_chunk,
                 )  # o: [B, L, d_model], final_state: [B, D, D]
                 
+                # ⚡ FIX: apply the mixer's dropout like the sequential path
+                # does (on the branch, before the residual add) — it was
+                # silently skipped in the parallel training path, making the
+                # config's dropout a no-op for GLT mixers.
+                if block.mixer.dropout.p > 0:
+                    o = block.mixer.dropout(o)
                 x = residual + o
                 x = block.ffn(x)
                 
@@ -677,6 +728,7 @@ class ContinuumModel(nn.Module):
         token_ids: torch.Tensor,
         glt_states: Optional[List[Optional[torch.Tensor]]] = None,
         window_caches: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+        core_max_loops: Optional[int] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Full forward pass for one or more tokens.
@@ -685,6 +737,10 @@ class ContinuumModel(nn.Module):
             token_ids: [B, seq_len] token IDs
             glt_states: List of GLT states (one per GLT layer), or None to init
             window_caches: List of (window_k, window_v) tuples (one per Anchor layer), or None
+            core_max_loops: Max ADL loops for the Reasoning Core. None uses
+                            config.n_max_loops; pass 1 to disable looping
+                            (recommended for checkpoints trained without
+                            full-ADL steps).
 
         Returns:
             Dict with:
@@ -698,9 +754,14 @@ class ContinuumModel(nn.Module):
         device = token_ids.device
         dtype = self.embedding.embed_table.weight.dtype
 
-        # Initialize states if needed
+        # ⚡ FIX: initialize whichever state list is missing instead of
+        # silently discarding a provided one.
         if glt_states is None or window_caches is None:
-            glt_states, window_caches = self.init_states(B, str(device), dtype)
+            fresh_glt, fresh_windows = self.init_states(B, str(device), dtype)
+            if glt_states is None:
+                glt_states = fresh_glt
+            if window_caches is None:
+                window_caches = fresh_windows
 
         # Token → embeddings
         x = self.embedding.embed(token_ids)  # [B, seq_len, d_model]
@@ -729,7 +790,8 @@ class ContinuumModel(nn.Module):
 
             # Stage 2: Reasoning Core (looped)
             xt, glt_states, window_caches, n_loops, ponder = self._run_stage_core(
-                xt, glt_states, window_caches, pmb_readouts, token_idx=t
+                xt, glt_states, window_caches, pmb_readouts, token_idx=t,
+                max_loops=core_max_loops,
             )
             total_loops += n_loops
             total_ponder = total_ponder + ponder
@@ -1031,6 +1093,13 @@ class ContinuumModel(nn.Module):
         self.eval()
         device = prompt_ids.device
         B = prompt_ids.shape[0]
+        # ⚡ FIX: generation only ever tracked/sampled batch item 0 (and
+        # returned a [1, len] tensor even for B > 1) — fail loudly instead.
+        if B != 1:
+            raise ValueError(
+                f"ContinuumModel.generate() supports batch size 1 only (got {B}); "
+                "loop over the batch instead."
+            )
         generated = list(prompt_ids[0].tolist())
         loop_counts = []
 

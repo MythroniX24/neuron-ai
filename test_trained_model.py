@@ -9,6 +9,10 @@ PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 CHECKPOINT_DIR = os.path.join(PROJECT_DIR, 'checkpoints')
 CKPT_PATH = os.path.join(CHECKPOINT_DIR, 'continuum_max_for_mobile.pt')
 TOKENIZER_PATH = os.path.join(CHECKPOINT_DIR, 'tokenizer_16k.json')
+if not os.path.exists(TOKENIZER_PATH):
+    # ⚡ FIX: fall back to the repo tokenizer when checkpoints/ has none
+    TOKENIZER_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  'continuum', 'tokenizer', 'tokenizer_4k.json')
 
 print('=' * 60)
 print('🧠 CONTINUUM-MAX TRAINED MODEL TEST')

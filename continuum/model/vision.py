@@ -300,22 +300,26 @@ class BiGLTBlock(nn.Module):
         residual = x
 
         # Forward pass (left → right)
-        x_fwd, new_state_fwd = self.glt_fwd.forward_sequence(
-            self.norm_fwd(x), state_fwd
-        )
+        normed_fwd = self.norm_fwd(x)
+        x_fwd, new_state_fwd = self.glt_fwd.forward_sequence(normed_fwd, state_fwd)
 
         # Reverse pass (right → left): flip sequence, process, flip back
-        x_rev_flipped = torch.flip(self.norm_rev(x), dims=[1])
+        normed_rev = self.norm_rev(x)
+        x_rev_flipped = torch.flip(normed_rev, dims=[1])
         x_rev_out, new_state_rev = self.glt_rev.forward_sequence(
             x_rev_flipped, state_rev
         )
         x_rev = torch.flip(x_rev_out, dims=[1])  # flip back to original order
 
-        # Combine directions: average (stable, doesn't amplify)
-        x_combined = (x_fwd + x_rev) * 0.5
+        # ⚡ FIX: GLTLayer.forward_sequence returns residual + scan (the normed
+        # input is added back inside the layer), so the old code added the
+        # raw residual AGAIN before the FFN: ffn(x + norm(x) + glt) — the
+        # normed input leaked in as signal and the residual was doubled.
+        # Strip the normed inputs out so the residual is added exactly once.
+        branch = ((x_fwd - normed_fwd) + (x_rev - normed_rev)) * 0.5
 
         # FFN with residual
-        out = self.ffn(x_combined + residual)
+        out = self.ffn(branch + residual)
 
         return out, new_state_fwd, new_state_rev
 
@@ -440,10 +444,29 @@ class SpatialAnchorBlock(nn.Module):
         k_gqa = k.repeat_interleave(n_groups, dim=2)
         v_gqa = v.repeat_interleave(n_groups, dim=2)
 
+        # ⚡ FIX: restrict patch→patch attention to a spatial window. The
+        # block's contract is "learnable anchors + LOCAL spatial window";
+        # attending over the full image made this a second global attention
+        # layer. Anchors stay globally visible; patches see only nearby
+        # patches within window_size (measured in grid distance).
+        rows = torch.arange(N, device=x.device)
+        dist = (rows.unsqueeze(1) - rows.unsqueeze(0)).abs()
+        patch_mask = dist <= self.window_size  # [N, N]
+        anchor_visible = torch.ones(
+            N, self.n_anchors, dtype=torch.bool, device=x.device
+        )
+        visible = torch.cat([anchor_visible, patch_mask], dim=-1)  # [N, T]
+        attn_mask = torch.where(
+            visible,
+            torch.zeros((), device=x.device, dtype=q.dtype),
+            torch.full((), float("-inf"), device=x.device, dtype=q.dtype),
+        )
+
         output = F.scaled_dot_product_attention(
             q.transpose(1, 2),  # [B, n_heads, N, hd]
             k_gqa.transpose(1, 2),  # [B, n_heads, T, hd]
             v_gqa.transpose(1, 2),
+            attn_mask=attn_mask,
             dropout_p=self.dropout.p if self.training else 0.0,
         )
         output = output.transpose(1, 2).reshape(B, N, self.n_heads * self.head_dim)
@@ -583,21 +606,29 @@ class ContinuumVisionEncoder(nn.Module):
 
         # Safety: cap patches for mobile
         if N > config.max_patches:
-            # Downsample by taking every step-th patch (simple, effective)
-            # This preserves original aspect ratio better than resizing
-            step = math.ceil(N / config.max_patches)
-            x = x[:, ::step, :]
-            N = x.shape[1]
-            # Adjust grid shape: preserve aspect ratio, trim to exact H_p*W_p
+            # ⚡ FIX: grid-preserving subsample. The old every-step-th slice
+            # mixed rows and columns (broke the 2D grid RoPE expects) and the
+            # recomputed H/W didn't match the surviving patches. Take whole
+            # rows/columns instead: pick a column stride that keeps the grid
+            # rectangular, then trim whole rows if still over budget.
             H_p_orig, W_p_orig = grid_shape
-            ratio = W_p_orig / max(H_p_orig, 1)
-            H_p = max(1, round(math.sqrt(N / ratio)))
-            W_p = N // H_p
-            # Trim patches to exact grid product (lose at most H_p-1 patches)
-            exact_N = H_p * W_p
-            x = x[:, :exact_N, :]
-            N = exact_N
-            grid_shape = (H_p, W_p)
+            col_step = max(1, math.ceil(W_p_orig / max(1, round(math.sqrt(config.max_patches * W_p_orig / max(H_p_orig, 1))))))
+            row_step = max(1, math.ceil(H_p_orig / max(1, round(math.sqrt(config.max_patches * H_p_orig / max(W_p_orig, 1))))))
+            # keep every col_step-th column and row_step-th row
+            keep_cols = list(range(0, W_p_orig, col_step))
+            keep_rows = list(range(0, H_p_orig, row_step))
+            idx = []
+            for r in keep_rows:
+                for c in keep_cols:
+                    idx.append(r * W_p_orig + c)
+            # hard cap: trim whole rows first if still over budget
+            while len(idx) > config.max_patches and len(keep_rows) > 1:
+                keep_rows = keep_rows[:-1]
+                idx = [r * W_p_orig + c for r in keep_rows for c in keep_cols]
+            idx_t = torch.tensor(idx, device=x.device, dtype=torch.long)
+            x = x.index_select(1, idx_t)
+            N = x.shape[1]
+            grid_shape = (len(keep_rows), len(keep_cols))
 
         # 2. Apply 2D RoPE
         x = self.rope(x, grid_shape)

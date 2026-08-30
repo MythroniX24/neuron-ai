@@ -339,10 +339,22 @@ def export_gguf(model, output_path: str):
     # ─── Write Tensor Data ───
     data_start = f.tell()
 
+    # ⚡ FIX: offsets computed in the first pass assumed data starts at 0;
+    # the header+metadata+infos are written first, so every tensor's offset
+    # must be relative to data_start (where the aligned data section begins).
+    for name in tensor_offsets:
+        tensor_offsets[name] += data_start
+
     def write_weight(tensor, name: str):
-        """Write tensor data, transposing to match GGUF convention (row-major)."""
+        """Write tensor data, transposing to match GGUF convention (row-major).
+
+        ⚡ FIX: the class has no write_tensor_data() method — this call raised
+        AttributeError at the first tensor, after the header and tensor infos
+        were already written (truncated, unreadable file). Write the raw
+        array here, C-contiguous, little-endian F32.
+        """
         arr = tensor.detach().cpu().float().numpy()
-        f.write_tensor_data(arr)
+        f.write_raw(np.ascontiguousarray(arr).astype("<f4").tobytes())
         # Pad to alignment
         remainder = (f.tell() - data_start) % ALIGNMENT
         if remainder:

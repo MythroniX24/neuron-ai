@@ -19,7 +19,12 @@ print(f'   ✅ global_step={ckpt.get("global_step","?")}')
 # 2. Tokenizer
 print('\n2️⃣ Loading tokenizer...')
 from continuum.tokenizer.bpe import ContinuumTokenizer
-tokenizer = ContinuumTokenizer.load('checkpoints/tokenizer_16k.json')
+import glob as _glob
+_ckpt_tok = 'checkpoints/tokenizer_16k.json'
+if not os.path.exists(_ckpt_tok):
+    _fallback = sorted(_glob.glob(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'continuum', 'tokenizer', 'tokenizer_*.json')))
+    _ckpt_tok = _fallback[0] if _fallback else _ckpt_tok
+tokenizer = ContinuumTokenizer.load(_ckpt_tok)
 print(f'   ✅ {tokenizer.vocab_size_actual} tokens')
 
 # 3. Test INT8 quantized inference

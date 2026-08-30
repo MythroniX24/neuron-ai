@@ -55,12 +55,19 @@ class ContinuumTrainer:
         compile_model: bool = False,
         use_parallel_forward: bool = True,
         use_gradient_checkpointing: bool = False,  # ⚡ Phase 8: Save VRAM on embedding output
+        adl_train_every: int = 0,  # ⚡ 0 = never (legacy); N = every Nth optimizer step runs full-ADL
     ):
         self.model = model
         self.device = device
         self.checkpoint_dir = checkpoint_dir
         self.log_interval = log_interval
         self.use_amp = use_amp and (device == "cuda")
+        # ⚡ ADL training cadence: 0 keeps the legacy pure-1-loop fast path (the
+        # halting head then learns only via the fast-path ponder prior). A
+        # positive N schedules every Nth optimizer step as a full-ADL step
+        # (core_max_loops=None) so the halting head also receives the CE
+        # counter-pressure that justifies looping when it genuinely helps.
+        self.adl_train_every = max(0, adl_train_every)
 
         self.model.to(device)
         if device == "cuda":
@@ -231,6 +238,28 @@ class ContinuumTrainer:
             for param_group in self.optimizer.param_groups:
                 param_group["lr"] = self.base_lr * lr_scale
 
+    def _collect_ffn_gates(self) -> Optional[torch.Tensor]:
+        """Collect the last forward pass's GatedShardFFN gate values.
+
+        ⚡ FIX: the sparsity regularizer was dead code — train_step always passed
+        ffn_gates=None, so ContinuumLoss's gate term never received gradients
+        and the gates were never pushed toward 0/1. GatedShardFFN caches its
+        gates WITH grad during training (self._last_gates); stack them across
+        layers into the [B, L, K, n_layers] tensor the loss expects.
+        """
+        gate_lists: List[torch.Tensor] = []
+        for block in (list(self.model.perception_blocks) +
+                      list(self.model.core_blocks) +
+                      list(self.model.output_blocks)):
+            ffn = getattr(block, "ffn", None)
+            gates = getattr(ffn, "_last_gates", None) if ffn is not None else None
+            if gates is not None:
+                gate_lists.append(gates)
+        if not gate_lists:
+            return None
+        # Per-layer gates are [B, L, K]; stack on a trailing layer axis.
+        return torch.stack(gate_lists, dim=-1)
+
     def train_step(
         self,
         batch: Dict[str, torch.Tensor],
@@ -284,12 +313,21 @@ class ContinuumTrainer:
             self.optimizer.zero_grad(set_to_none=True)  # Faster than zero_grad()
 
         # ⚡ AMP: Forward pass in FP16 (Tensor Cores enabled)
-        # ⚡ core_max_loops=1: Single-pass Core during training (ADL disabled)
+        # ⚡ core_max_loops: 1 on the regular fast path; on scheduled full-ADL
+        # steps (every adl_train_every-th optimizer step) None lets the Core
+        # loop with halting so the halting head sees real CE trade-offs.
         with torch.amp.autocast("cuda", enabled=self.use_amp, dtype=torch.float16):
+            adl_step = (
+                self.adl_train_every > 0
+                and is_optimizer_step
+                and self._optimizer_step_count % self.adl_train_every == 0
+            )
             if self.use_parallel_forward:
-                result = self.model.forward_parallel(input_ids, core_max_loops=1)
+                result = self.model.forward_parallel(
+                    input_ids, core_max_loops=None if adl_step else 1
+                )
             else:
-                result = self.model.forward(input_ids)
+                result = self.model.forward(input_ids, core_max_loops=None if adl_step else 1)
             logits = result["logits"]
             ponder_cost = result["ponder_cost"]
 
@@ -303,7 +341,7 @@ class ContinuumTrainer:
                 logits=shift_logits,
                 targets=shift_labels,
                 ponder_cost=ponder_cost,
-                ffn_gates=None,
+                ffn_gates=self._collect_ffn_gates(),
             )
 
         # Gradient accumulation: average loss over accumulation steps
@@ -439,11 +477,16 @@ class ContinuumTrainer:
             labels = batch["labels"].to(self.device, non_blocking=True)
 
             # Use AMP for validation too (faster on T4)
+            # ⚡ FIX: validate with the SAME core_max_loops the fast training path
+            # uses (1). The old call passed no arg, so validation ran full-ADL
+            # with the (possibly untrained) halting head — val_loops reported
+            # 2+ loops for a model trained at 1 loop and val_loss diverged from
+            # the training distribution.
             with torch.amp.autocast("cuda", enabled=self.use_amp, dtype=torch.float16):
                 if self.use_parallel_forward:
-                    result = self.model.forward_parallel(input_ids)
+                    result = self.model.forward_parallel(input_ids, core_max_loops=1)
                 else:
-                    result = self.model.forward(input_ids)
+                    result = self.model.forward(input_ids, core_max_loops=1)
                 logits = result["logits"]
 
                         # ⚡ Slices are already contiguous in memory
@@ -520,6 +563,7 @@ class ContinuumTrainer:
         print(f"Device: {self.device}")
         mode = "Parallel (Phase 2)" if self.use_parallel_forward else "Sequential"
         print(f"Forward mode: {mode}")
+        print(f"ADL training: {'every %d optimizer steps' % self.adl_train_every if self.adl_train_every else 'off (fast-path ponder prior only)'}")
         if self.use_compiled:
             print(f"Compile mode: {self.compile_mode}")
         # batch_size may come from DataLoader.batch_size OR batch_sampler.batch_size (bucket sampler)
@@ -562,8 +606,11 @@ class ContinuumTrainer:
                     accumulation_step=accum_idx,
                     total_accumulation_steps=grad_accum_steps,
                 )
-                epoch_loss += metrics["loss"]
-                epoch_steps += 1
+                # ⚡ FIX: NaN-skip steps return loss 0.0 sentinel — excluding them
+                # keeps epoch_loss an honest average instead of diluting with 0.0.
+                if metrics["loss"] != 0.0 or metrics["ce_loss"] != 0.0:
+                    epoch_loss += metrics["loss"]
+                    epoch_steps += 1
 
                 # Update progress bar after each optimizer step
                 if accum_idx == grad_accum_steps and self.global_step % self.log_interval == 0:

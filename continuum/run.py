@@ -115,19 +115,21 @@ def cmd_train(args):
 
     # Train/val split on the encoded list (before padding)
     val_size = max(1, len(encoded) // 10)
+    train_ds = _TextDataset(encoded[:-val_size])
+    val_ds = _TextDataset(encoded[-val_size:])
     train_loader = DataLoader(
-        _TextDataset(encoded[:-val_size]),
+        train_ds,
         batch_size=args.batch_size,
         shuffle=True,
         collate_fn=_collate,
     )
     val_loader = DataLoader(
-        _TextDataset(encoded[-val_size:]),
+        val_ds,
         batch_size=args.batch_size,
         collate_fn=_collate,
     )
 
-    print(f"Train: {len(train_dataset)} sequences, Val: {len(val_dataset)} sequences")
+    print(f"Train: {len(train_ds)} sequences, Val: {len(val_ds)} sequences")
     print("Starting training...")
 
     trainer.train(

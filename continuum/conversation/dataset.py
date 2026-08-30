@@ -278,12 +278,25 @@ class ConversationalDataset:
 
     @staticmethod
     def _mask_non_assistant_tokens_static(tokenizer, assistant_pattern: str, labels: List[int], tokens: List[int]) -> List[int]:
-        """Static core of _mask_non_assistant_tokens (worker-safe)."""
-        # Find all occurrences of assistant token
+        """Static core of _mask_non_assistant_tokens (worker-safe).
+
+        ⚡ FIX: the assistant section used to close ONLY on the <eos> special id.
+        Multi-turn conversations carry a single <eos> at the very end, so every
+        token after the FIRST assistant turn (the next turn's user/system
+        template markers and user text) was trained as assistant output. The
+        section now also closes at the '<|end|>' chat marker that terminates
+        each assistant turn — its own label is kept so the model still learns
+        to emit the turn-boundary marker.
+        """
+        # Find positions where assistant response begins
         assistant_ids = tokenizer.encode(assistant_pattern)
 
         if not assistant_ids:
             return labels
+
+        # ⚡ FIX: per-turn close marker ('<|end|>') ids — closes the assistant
+        # section after each response instead of running to the final <eos>.
+        end_ids = tokenizer.encode(ChatTemplate.END_TOKEN)
 
         # Simple approach: find positions where assistant starts
         masked = [-100] * len(labels)
@@ -300,6 +313,17 @@ class ConversationalDataset:
                     continue
 
             if in_assistant:
+                # ⚡ FIX: close the assistant section at the '<|end|>' marker.
+                # Labels THROUGH the end marker stay active (the model must
+                # learn to emit the turn boundary); everything after is masked.
+                if end_ids and i + len(end_ids) <= len(tokens) and tokens[i:i+len(end_ids)] == end_ids:
+                    for k in range(len(end_ids)):
+                        if i + k < len(labels):
+                            masked[i + k] = labels[i + k]
+                    i += len(end_ids)
+                    in_assistant = False
+                    continue
+
                 if i < len(labels):
                     # Check for end token or next user token
                     if tokens[i] == tokenizer.eos_id:

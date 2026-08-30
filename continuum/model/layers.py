@@ -274,6 +274,10 @@ class GatedShardFFN(nn.Module):
         # Soft gating: a single linear -> sigmoid per shard
         self.gate_head = nn.Linear(d_model, num_shards, bias=True)
 
+        # Last training-mode gate values (kept WITH grad so the sparsity
+        # regularizer in ContinuumLoss can backprop through them).
+        self._last_gates = None
+
         # Pre-norm
         self.norm = RMSNorm(d_model)
 
@@ -313,6 +317,9 @@ class GatedShardFFN(nn.Module):
 
         # ⚡ Phase 1: Fused forward — single matmuls instead of K separate ones
         gates = torch.sigmoid(self.gate_head(x_norm))  # [B, L, num_shards]
+        # Cache gates for the sparsity regularizer / monitor (training only;
+        # kept WITH gradient — ContinuumLoss penalizes g*(1-g) through these).
+        self._last_gates = gates if self.training else None
 
         # Single fused gate_proj: [B, L, total_intermediate]
         gate_out = self.gate_proj_fused(x_norm)
@@ -334,9 +341,9 @@ class GatedShardFFN(nn.Module):
         # Single fused down_proj
         output = self.down_proj_fused(gated_swiglu_flat)  # [B, L, d_model]
 
-        # Residual connection
-        output = output + residual
-        output = self.dropout(output)
+        # Residual connection (dropout on the FFN branch only — never on the
+        # residual path, matching the GLT layer's convention)
+        output = self.dropout(output) + residual
 
         if was_2d:
             output = output.squeeze(1)
@@ -344,9 +351,12 @@ class GatedShardFFN(nn.Module):
         return output
 
     def sparsity(self) -> float:
-        """Report fraction of gates that were zero during the last forward pass.
-        Used for monitoring sparsity regularization during training."""
-        return 0.0  # Placeholder — tracked externally during training
+        """Report fraction of gates below sparsity_threshold in the last
+        TRAINING forward pass. Returns 0.0 in eval mode (gates not cached)."""
+        g = getattr(self, "_last_gates", None)
+        if g is None or g.numel() == 0:
+            return 0.0
+        return (g < self.sparsity_threshold).float().mean().item()
 
     @staticmethod
     def get_compiled_ffn(d_model, expansion, num_shards, dropout=0.0):
@@ -358,8 +368,13 @@ class GatedShardFFN(nn.Module):
         Usage:
             ffn = GatedShardFFN.get_compiled_ffn(d_model=768, expansion=4, num_shards=6)
         """
+        # ⚡ FIX: pass dropout as a KEYWORD arg. Positionally it used to land in
+        # `sparsity_threshold` (the 4th __init__ param), silently disabling
+        # dropout entirely on the compiled FFN.
         return torch.compile(
-            GatedShardFFN(d_model, expansion, num_shards, dropout),
+            GatedShardFFN(
+                d_model, expansion=expansion, num_shards=num_shards, dropout=dropout
+            ),
             mode="default",
             fullgraph=False,
         )
