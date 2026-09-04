@@ -285,9 +285,15 @@ def _glt_scan_einsum_with_state(
     L = gamma.shape[1]
     g = gamma.unsqueeze(1)  # [B, 1, L, D]
     j_idx = torch.arange(L, device=gamma.device)
-    causal = j_idx.unsqueeze(1) < j_idx.unsqueeze(0)  # [L, L] m > j
-    M = torch.where(causal.unsqueeze(0).unsqueeze(-1), g, torch.ones_like(g))
+    after = j_idx.unsqueeze(1) < j_idx.unsqueeze(0)  # [L, L] m > j
+    M = torch.where(after.unsqueeze(0).unsqueeze(-1), g, torch.ones_like(g))
     R = M.cumprod(dim=2)  # [B, L, L, D]
+    # Causal mask: t < j means position j is in the FUTURE of t and must
+    # contribute nothing (the empty product would otherwise evaluate to 1).
+    # CI caught this as a 145-magnitude output drift vs the sequential
+    # recurrence — future tokens were leaking into every readout.
+    ge = (j_idx.unsqueeze(1) <= j_idx.unsqueeze(0))  # [L, L] j <= t
+    R = R * ge.unsqueeze(0).unsqueeze(-1)
 
     # h[b,t,d] = Σ_j (iota_j ⊙ k_j)[b,j,d] · R[b,j,t,d] · scores[b,j,t]
     term = R * scores.unsqueeze(-1) * (k * iota).unsqueeze(2)  # [B, L, L, D]
