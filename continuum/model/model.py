@@ -244,6 +244,10 @@ class ContinuumModel(nn.Module):
         # docstring below promises) — this aligns Python with it.
         self._glt_built = 0
         self._anchor_built = 0
+        # FIX (T4 OOM): GLT scan gradient-checkpoint override. Auto-enabled by
+        # shape inside _run_stage_parallel when the retained scan graph would
+        # crowd the GPU; tests force it directly. Default off = unchanged path.
+        self._ckpt_scan = False
 
         # Stage 1: Perception (anchor_interval=3)
         self.perception_blocks = nn.ModuleList()
@@ -625,6 +629,33 @@ class ContinuumModel(nn.Module):
 
         return glt_states, window_caches
 
+    def _glt_scan_branch(self, block, x_norm):
+        """Run one GLT block's mixer: gates + parallel scan + readout.
+
+        Extracted from _run_stage_parallel so the WHOLE computation can be
+        gradient-checkpointed as one unit - the scan's [B, L, D, D] round
+        buffers dominate training VRAM. Deterministic (no dropout / RNG
+        inside): safe to recompute during backward.
+        """
+        mixer = block.mixer
+        k = mixer.W_k(x_norm)      # [B, L, d_state]
+        v = mixer.W_v(x_norm)
+        q = mixer.W_q(x_norm)
+        k = mixer.kv_norm(k)
+        v = mixer.kv_norm(v)
+        gamma = torch.sigmoid(mixer.W_gamma(x_norm))
+        iota = torch.sigmoid(mixer.W_iota(x_norm))
+        r_gate = torch.sigmoid(mixer.W_r(x_norm))
+
+        # Lazy import to avoid circular dependency with the training module
+        from continuum.training.parallel_scan import glt_parallel_forward_with_state
+
+        o, final_state = glt_parallel_forward_with_state(
+            k, v, q, gamma, iota, r_gate, mixer.W_o.weight,
+            chunk_size=None,  # full scan - checkpointing bounds memory instead
+        )  # o: [B, L, d_model], final_state: [B, D, D]
+        return o, final_state
+
     def _run_stage_parallel(
         self,
         x: torch.Tensor,
@@ -656,10 +687,7 @@ class ContinuumModel(nn.Module):
         """
         state_idx = state_offset
         window_idx = window_offset
-        
-        # Lazy import to avoid circular dependency with training module
-        from continuum.training.parallel_scan import glt_parallel_forward_with_state
-        
+
         # ⚡ FIX: state_idx must track BLOCK POSITION (init_states() indexes
         # glt_states by block position, with None at anchor slots) — advance it
         # on anchor blocks too, not just GLT ones.
@@ -670,39 +698,39 @@ class ContinuumModel(nn.Module):
                 x_norm = block.mixer.norm(x)  # [B, L, d_model]
                 D = block.mixer.d_state
                 B, L, _ = x_norm.shape
-                
-                k = block.mixer.W_k(x_norm)  # [B, L, d_state]
-                v = block.mixer.W_v(x_norm)
-                q = block.mixer.W_q(x_norm)
-                k = block.mixer.kv_norm(k)
-                v = block.mixer.kv_norm(v)
-                gamma = torch.sigmoid(block.mixer.W_gamma(x_norm))
-                iota = torch.sigmoid(block.mixer.W_iota(x_norm))
-                r_gate = torch.sigmoid(block.mixer.W_r(x_norm))
-                
-                # Parallel scan: O(log L) instead of O(L)
-                # ⚡ Chunked scan on CUDA: reduces peak VRAM from [B,L,D,D] to [B,32,D,D].
-                # ⚡ FIX: only chunk when the full-scan autograd graph would actually
-                # exceed ~4 GB (estimate ~8x the fp32 [B,L,D,D] outer product). The
-                # old fixed rule chunked every L>32 — at training batch 16-64 / L<=128
-                # the full path fits a 16 GB T4 easily and avoids the per-chunk fp32
-                # casts + doubled kernel launches that made steps ~2x slower.
-                _est_bytes = 8.0 * k.shape[0] * L * k.shape[-1] * k.shape[-1] * 4
-                _scan_chunk = 32 if (k.is_cuda and _est_bytes > 4e9) else None
-                o, final_state = glt_parallel_forward_with_state(
-                    k, v, q, gamma, iota, r_gate, block.mixer.W_o.weight,
-                    chunk_size=_scan_chunk,
-                )  # o: [B, L, d_model], final_state: [B, D, D]
-                
-                # ⚡ FIX: apply the mixer's dropout like the sequential path
-                # does (on the branch, before the residual add) — it was
+
+                # FIX (T4 OOM): the full scan's autograd graph retains ~8
+                # [B, L, D, D] round-buffers PER GLT LAYER. Once that total
+                # would crowd the GPU, gradient-checkpoint the mixer branch:
+                # intermediates are recomputed in backward instead of retained
+                # (peak memory drops ~3x at the L=96 / batch-24 curriculum
+                # end). Smaller shapes keep the fast uncheckpointed path.
+                _est_bytes = (8.0 * B * L * D * D
+                              * (2 if x_norm.dtype == torch.float16 else 4)
+                              * self.config.glt_layers)
+                _use_ckpt = bool(
+                    self._ckpt_scan
+                    or (x.is_cuda and self.training and _est_bytes > 11.0e9)
+                )
+                if _use_ckpt:
+                    o, final_state = torch.utils.checkpoint.checkpoint(
+                        lambda xn: self._glt_scan_branch(block, xn),
+                        x_norm,
+                        use_reentrant=False,
+                    )
+                else:
+                    o, final_state = self._glt_scan_branch(block, x_norm)
+
+                # FIX: apply the mixer's dropout like the sequential path
+                # does (on the branch, before the residual add) - it was
                 # silently skipped in the parallel training path, making the
-                # config's dropout a no-op for GLT mixers.
+                # config's dropout a no-op for GLT mixers. Kept OUTSIDE the
+                # checkpointed region so recompute never re-rolls RNG.
                 if block.mixer.dropout.p > 0:
                     o = block.mixer.dropout(o)
                 x = residual + o
                 x = block.ffn(x)
-                
+
                 glt_states[state_idx] = final_state
                 state_idx += 1
             

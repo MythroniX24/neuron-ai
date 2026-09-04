@@ -142,3 +142,33 @@ def test_anchor_positions_match_build_contract():
     actual = [i for i, b in enumerate(blocks) if b.is_anchor]
     assert actual == expected, f"anchor positions {actual} != expected {expected}"
     assert actual == [2, 5, 8], f"unexpected max-tier interleaving: {actual}"
+
+def test_scan_gradient_checkpointing_matches_plain():
+    """Checkpointing the GLT scan branch must reproduce the plain full-scan
+    path EXACTLY (logits AND parameter gradients). The T4 OOM fix auto-enables
+    checkpointing at large batch x seq; any recompute drift would corrupt
+    training silently, so this pins bit-level parity on the CPU path."""
+    model = create_continuum_nano()
+    model.train()
+    ids = torch.randint(0, 8000, (2, 24))
+
+    def run(with_ckpt):
+        model.zero_grad(set_to_none=True)
+        model._ckpt_scan = with_ckpt
+        out = model.forward_parallel(ids, core_max_loops=1)
+        out["logits"].float().pow(2).mean().backward()
+        return out["logits"], [p.grad.clone() for p in model.parameters()]
+
+    logits_ckpt, grads_ckpt = run(True)
+    logits_plain, grads_plain = run(False)
+
+    max_fwd = (logits_ckpt - logits_plain).abs().max().item()
+    assert torch.allclose(logits_ckpt, logits_plain, atol=1e-5, rtol=1e-4), (
+        f"checkpointed forward drifted from plain scan (max diff {max_fwd:.6f})"
+    )
+    names = [n for n, _ in model.named_parameters()]
+    for name, gc, gp in zip(names, grads_ckpt, grads_plain):
+        assert torch.allclose(gc, gp, atol=1e-5, rtol=1e-4), (
+            f"checkpointed gradient drift on {name}: "
+            f"max diff {(gc - gp).abs().max().item():.6f}"
+        )

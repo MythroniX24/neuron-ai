@@ -23,6 +23,21 @@ import torch.nn.functional as F
 from typing import Tuple, Optional
 
 
+def _scan_dtype_for(k: torch.Tensor) -> torch.dtype:
+    """Resolve the associative-scan dtype for one GLT layer.
+
+    FP16 on CUDA under AMP: halves the [B, L, D, D] scan memory traffic
+    (k/v are clamped to +-16 and RMS-normed to O(1), so accumulated state
+    stays far inside FP16 range). FP32 everywhere else; set
+    CONTINUUM_SCAN_FP32=1 to force FP32 even on CUDA.
+    """
+    if os.environ.get("CONTINUUM_SCAN_FP32") == "1":
+        return torch.float32
+    if k.is_cuda and k.dtype == torch.float16:
+        return torch.float16
+    return torch.float32
+
+
 def _associative_scan_core(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -272,12 +287,7 @@ def glt_parallel_forward(
         # inputs are O(1) and k/v are clamped to ±16, so per-position state
         # sums stay far inside FP16 range. CPU / FP32 runs and the old
         # behaviour are unchanged; CONTINUUM_SCAN_FP32=1 forces FP32.
-        scan_dtype = (
-            torch.float32
-            if (os.environ.get("CONTINUUM_SCAN_FP32") == "1"
-                or not (k.is_cuda and k.dtype == torch.float16))
-            else torch.float16
-        )
+        scan_dtype = _scan_dtype_for(k)
         gamma_f32 = gamma.to(scan_dtype)
         gated_input_f32 = gated_input.to(scan_dtype)
         states = associative_scan(gamma_f32, gated_input_f32)
@@ -325,7 +335,10 @@ def glt_parallel_forward_with_state(
         outer = k_safe.unsqueeze(-1) @ v_safe.unsqueeze(-2)
         gated_input = iota.unsqueeze(-1) * outer
 
-        scan_dtype = torch.float32
+        # FIX (T4 OOM): FP16 under AMP, exactly like glt_parallel_forward().
+        # Training calls THIS entry point, and it hardcoded FP32: at batch 24
+        # / L=64 the FP32 [B,L,D,D] scan graph alone exceeded 14.5 GiB.
+        scan_dtype = _scan_dtype_for(k)
         gamma_f32 = gamma.to(scan_dtype)
         gated_input_f32 = gated_input.to(scan_dtype)
         states = associative_scan(gamma_f32, gated_input_f32)
