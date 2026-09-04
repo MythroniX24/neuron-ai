@@ -36,30 +36,16 @@ jobs:
 
       - name: Syntax check all Python files
         run: |
-          python -m py_compile continuum/__init__.py
-          python -m py_compile continuum/model/model.py
-          python -m py_compile continuum/model/layers.py
-          python -m py_compile continuum/model/attention.py
-          python -m py_compile continuum/training/trainer.py
-          python -m py_compile continuum/training/losses.py
-          python -m py_compile continuum/training/parallel_scan.py
-          python -m py_compile continuum/conversation/dataset.py
-          python -m py_compile continuum/conversation/manager.py
-          python -m py_compile continuum/conversation/template.py
-          python -m py_compile continuum/inference/engine.py
-          python -m py_compile continuum/tokenizer/bpe.py
+          python -m compileall -q continuum
           echo "✅ All Python files compile successfully!"
 
-      - name: Run unit tests
+      - name: Run full unit test suite (failures fail the build)
+        working-directory: continuum
         run: |
-          cd continuum
-          python -m pytest model/test_model.py -v --tb=short --no-header -k "test_create" 2>&1 || true
-          python -m pytest model/test_layers.py -v --tb=short --no-header 2>&1 || true
-          # Audit-fix regression tests (fast, deterministic, CPU-only) — must pass
-          python -m pytest model/test_audit_fixes.py inference/test_engine.py -v --tb=short --no-header
-          echo "✅ Tests completed (some may be skipped on CPU)"
+          python -m pytest model/ inference/ tokenizer/ conversation/ \
+            -v --tb=short --no-header --maxfail=3
 
-      - name: Verify model creation
+      - name: Verify model forward + state-carry regression
         run: |
           python3 -c "
           import sys, torch
@@ -71,3 +57,16 @@ jobs:
           assert out['logits'].shape == (1, 8, 8000), f'Shape mismatch: {out[\"logits\"].shape}'
           print(f'✅ Model test PASSED: {model.num_params:,} params')
           "
+
+  cpp:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build C++ engine (compile check)
+        run: |
+          cd continuum.cpp
+          make -j2
+          ./build/continuum --help >/dev/null
+          echo "✅ C++ build PASSED"

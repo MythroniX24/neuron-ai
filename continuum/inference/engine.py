@@ -290,8 +290,12 @@ class ContinuumSpeculativeDecoder:
     4. Result: ~3-5x faster, MATHEMATICALLY IDENTICAL output to 100M model
 
     Algorithm: Leviathan et al. (2023) / Chen et al. (2023) speculative decoding.
-    Why it's quality-lossless: the target model verifies every token. If draft
-    is wrong, target's prediction is used instead. Output = pure 100M model output.
+    NOTE: this implementation uses a simplified deterministic acceptance rule —
+    a draft token is accepted only when it equals the target's ARGMAX, otherwise
+    the target's argmax replaces it. That is NOT the exact q(x)/p(x) stochastic
+    acceptance of Leviathan et al., so the output distribution is not literally
+    "identical to the target model" — it is a fast greedy-corrected approximation
+    (identical when sampling temperature → 0).
     """
 
     def __init__(
@@ -409,11 +413,19 @@ class ContinuumSpeculativeDecoder:
         )
         prompt_tensor = torch.tensor([prompt_ids], device=self.device)
 
-        # Initialize both engines with the prompt
-        self.draft_engine.start_conversation()
-        self.target_engine.start_conversation()
-        self.draft_engine.conversation_tokens = list(prompt_ids)
-        self.target_engine.conversation_tokens = list(prompt_ids)
+        # ⚡ FIX: preserve multi-turn conversation state — only start fresh when
+        # there is no active state. Every generate() call used to reset both
+        # engines, so chat history never survived a turn and the model answered
+        # each message with zero context.
+        fresh = self.target_engine.glt_states is None
+        if fresh:
+            self.draft_engine.start_conversation()
+            self.target_engine.start_conversation()
+            self.draft_engine.conversation_tokens = list(prompt_ids)
+            self.target_engine.conversation_tokens = list(prompt_ids)
+        else:
+            self.draft_engine.conversation_tokens.extend(prompt_ids)
+            self.target_engine.conversation_tokens.extend(prompt_ids)
 
         draft_fwd = self.draft_engine.model.forward
         target_fwd = self.target_engine._compiled_forward or self.target_engine.model.forward
@@ -1096,8 +1108,13 @@ class ContinuumInference:
         if self.tokenizer is None:
             raise ValueError("Tokenizer required for text generation")
 
+        # ⚡ FIX: prepend <bos> ONLY on a fresh conversation — matches
+        # _generate_text(). The stream path previously hardcoded add_bos=True,
+        # injecting a spurious mid-conversation <bos> the model never saw
+        # during training on every turn after the first.
+        add_bos = len(self.conversation_tokens) == 0
         prompt_ids = self.tokenizer.encode_with_special(
-            prompt, add_bos=True, add_eos=False
+            prompt, add_bos=add_bos, add_eos=False
         )
         prompt_tensor = torch.tensor([prompt_ids], device=self.device)
         self.conversation_tokens.extend(prompt_ids)
@@ -1151,14 +1168,16 @@ class ContinuumInference:
             self.conversation_tokens.append(int(token_id_val))
             self._maybe_write_pmb()
 
-            # Yield token text before checking EOS (user sees every token)
+            # ⚡ FIX: chat-marker stop detection BEFORE yielding — the marker
+            # tokens themselves (e.g. '<|end|>') must never reach the client
+            # (the non-stream path truncates them via _truncate_at_marker).
+            if self._hit_stop_sequence(self.conversation_tokens):
+                break
+
+            # Yield token text (user sees every token)
             yield self.tokenizer.decode([int(token_id_val)])
 
             if token_id_val == eos_id:
-                break
-
-            # ⚡ FIX: chat-marker stop detection (see _generate_text).
-            if self._hit_stop_sequence(self.conversation_tokens):
                 break
 
             result = forward_fn(next_token_tensor, self.glt_states, self.window_caches)

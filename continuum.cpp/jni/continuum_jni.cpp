@@ -35,6 +35,7 @@
 #include <cstring>
 #include <cstdio>
 #include <ctime>
+#include <algorithm>
 
 #include "model.h"
 #include "sampler.h"
@@ -50,7 +51,8 @@ using namespace continuum;
 static struct {
     ModelWeights weights;
     RuntimeState state;
-    Arena* arena = nullptr;
+    Arena* arena = nullptr;      // persistent: model weights + recurrent state (NEVER reset)
+    Arena* scratch = nullptr;    // per-token intermediates (rewind()'d every token)
     Sampler sampler;
     SamplerConfig samp_cfg;
     BPETokenizer tokenizer;
@@ -124,7 +126,14 @@ static void check_thermal() {
 // ============================================================================
 static bool load_model_internal(const std::string& path) {
     if (!g_engine.arena) {
-        g_engine.arena = new Arena(512 * 1024 * 1024);  // 512 MB
+        g_engine.arena = new Arena(512 * 1024 * 1024);  // 512 MB — weights + state
+    }
+    if (!g_engine.scratch) {
+        // ⚡ FIX: separate scratch arena for per-token intermediates. The old
+        // code called arena->reset() on the WEIGHTS arena every token, which
+        // zeroed all model weights (Arena::reset memsets the whole buffer) —
+        // inference produced garbage after the first token.
+        g_engine.scratch = new Arena(64 * 1024 * 1024);
     }
 
     FILE* f = fopen(path.c_str(), "rb");
@@ -320,10 +329,10 @@ static std::string generate_internal(
 
     // Prefill
     for (int32_t tok : tokens) {
-        g_engine.arena->reset();
-        embed_forward(g_engine.token_embed, tok, g_engine.weights.embed, *g_engine.arena);
+        g_engine.scratch->rewind();
+        embed_forward(g_engine.token_embed, tok, g_engine.weights.embed, *g_engine.scratch);
         continuum_forward(g_engine.logits, g_engine.state, g_engine.token_embed,
-                         g_engine.weights, cfg, *g_engine.arena);
+                         g_engine.weights, cfg, *g_engine.scratch);
     }
 
     // Generate with streaming
@@ -338,7 +347,7 @@ static std::string generate_internal(
     }
 
     for (int i = 0; i < max_tokens; i++) {
-        g_engine.arena->reset();
+        g_engine.scratch->rewind();
         int32_t token = g_engine.sampler.sample(g_engine.logits, g_engine.samp_cfg);
         if (token == cfg.eos_token_id) break;
 
@@ -362,9 +371,9 @@ static std::string generate_internal(
         check_thermal();
 
         // Forward next token
-        embed_forward(g_engine.token_embed, token, g_engine.weights.embed, *g_engine.arena);
+        embed_forward(g_engine.token_embed, token, g_engine.weights.embed, *g_engine.scratch);
         continuum_forward(g_engine.logits, g_engine.state, g_engine.token_embed,
-                         g_engine.weights, cfg, *g_engine.arena);
+                         g_engine.weights, cfg, *g_engine.scratch);
     }
 
     // Call onComplete
@@ -442,6 +451,11 @@ Java_com_continuum_slm_ContinuumEngine_saveState(
     FILE* f = fopen(p.c_str(), "wb");
     if (!f) return JNI_FALSE;
 
+    // ⚡ FIX: version the state format (v2 adds window_heads) so future
+    // format changes stay backward-readable.
+    int32_t ver = 2;
+    fwrite(&ver, sizeof(int32_t), 1, f);
+
     // Save GLT states
     for (auto& s : g_engine.state.glt_states) {
         fwrite(s.data, sizeof(float), s.n_elements(), f);
@@ -459,6 +473,12 @@ Java_com_continuum_slm_ContinuumEngine_saveState(
     // Save token counter
     fwrite(&g_engine.state.token_counter, sizeof(int32_t), 1, f);
 
+    // ⚡ FIX: persist the circular-buffer write positions — resuming without
+    // them misaligns the window caches on a paused/resumed app.
+    int32_t n_heads = (int32_t)g_engine.state.window_heads.size();
+    fwrite(&n_heads, sizeof(int32_t), 1, f);
+    fwrite(g_engine.state.window_heads.data(), sizeof(int32_t), n_heads, f);
+
     fclose(f);
     g_engine.state_path = p;
     return JNI_TRUE;
@@ -470,6 +490,17 @@ Java_com_continuum_slm_ContinuumEngine_loadState(
     std::string p = jstr_to_str(env, path);
     FILE* f = fopen(p.c_str(), "rb");
     if (!f) return JNI_FALSE;
+
+    // ⚡ FIX: v2 state files start with a version int. Pre-v2 files (no
+    // version marker) are read as legacy — no window_heads, heads reset to 0.
+    int32_t ver = 0;
+    bool has_version = fread(&ver, sizeof(int32_t), 1, f) == 1;
+    bool legacy = !has_version || ver != 2;
+    if (legacy) {
+        fseek(f, 0, SEEK_SET);
+        std::fill(g_engine.state.window_heads.begin(),
+                  g_engine.state.window_heads.end(), 0);
+    }
 
     for (auto& s : g_engine.state.glt_states) {
         fread(s.data, sizeof(float), s.n_elements(), f);
@@ -483,6 +514,14 @@ Java_com_continuum_slm_ContinuumEngine_loadState(
     fread(g_engine.state.pmb_slots.data, sizeof(float),
           g_engine.state.pmb_slots.n_elements(), f);
     fread(&g_engine.state.token_counter, sizeof(int32_t), 1, f);
+
+    if (!legacy) {
+        int32_t n_heads = 0;
+        if (fread(&n_heads, sizeof(int32_t), 1, f) == 1
+                && n_heads == (int32_t)g_engine.state.window_heads.size()) {
+            fread(g_engine.state.window_heads.data(), sizeof(int32_t), n_heads, f);
+        }
+    }
 
     fclose(f);
     return JNI_TRUE;

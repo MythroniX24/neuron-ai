@@ -9,7 +9,6 @@ As specified in Section 4 of the architecture:
 """
 
 import json
-import re
 from collections import Counter
 from typing import Dict, List, Optional, Tuple
 
@@ -27,9 +26,6 @@ class ContinuumTokenizer:
     PAD_TOKEN = "<pad>"
     BOS_TOKEN = "<bos>"
     EOS_TOKEN = "<eos>"
-
-    # Digit pattern for single-digit splitting
-    DIGIT_PATTERN = re.compile(r"\d")
 
     def __init__(self, vocab_size: int = 8000):
         """
@@ -69,14 +65,6 @@ class ContinuumTokenizer:
         self.token_to_bytes[self.bos_id] = self.BOS_TOKEN.encode("utf-8")
         self.token_to_bytes[self.eos_id] = self.EOS_TOKEN.encode("utf-8")
 
-    def _split_digits(self, text: str) -> str:
-        """
-        Pre-process: insert spaces around each digit so BPE never merges them.
-        "abc123def" -> "abc 1 2 3 def"
-        This implements the single-digit number tokenization from Section 4.
-        """
-        return self.DIGIT_PATTERN.sub(r" \g<0> ", text)
-
     def _text_to_bytes(self, text: str) -> List[int]:
         """Convert text to list of byte values (0-255)."""
         return list(text.encode("utf-8"))
@@ -115,11 +103,15 @@ class ContinuumTokenizer:
             texts: List of training texts
             verbose: Print progress
         """
-        # Convert texts to byte-level token IDs (already split digits)
+        # ⚡ FIX: tokenize training text EXACTLY like encode() does. The old
+        # _split_digits() inserted spaces around digits in the corpus, so
+        # training learned merges (" 1", "1 ", ...) that inference never sees
+        # and the same text produced DIFFERENT token IDs at train vs inference
+        # time. Encoding never merges two adjacent digit tokens, so training
+        # must never LEARN digit-digit merges either (handled below).
         all_ids = []
         for text in texts:
-            processed = self._split_digits(text)
-            byte_vals = self._text_to_bytes(processed)
+            byte_vals = self._text_to_bytes(text)
             token_ids = [self.byte_to_token[b] for b in byte_vals]
             all_ids.append(token_ids)
 
@@ -148,8 +140,17 @@ class ContinuumTokenizer:
             if not stats:
                 break
 
+            # ⚡ FIX: never LEARN a digit-digit merge — encode() refuses to
+            # apply them (single-digit number tokenization), so learning them
+            # would make train-time token IDs differ from inference-time IDs.
+            valid = {p: c for p, c in stats.items()
+                     if not (self._is_single_digit_token(p[0])
+                             and self._is_single_digit_token(p[1]))}
+            if not valid:
+                break  # corpus is (effectively) digits only — nothing left to learn
+
             # ⚡ OPTIMIZED: most_common(1) is O(1) after counting (uses C heapq)
-            best_pair, _ = stats.most_common(1)[0]
+            best_pair, _ = Counter(valid).most_common(1)[0]
             new_id = 259 + merge_step  # Start after base + special tokens
 
             # Record merge

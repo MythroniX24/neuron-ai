@@ -352,6 +352,12 @@ class ContinuumModel(nn.Module):
         state_idx = 0
         window_idx = 0
 
+        # ⚡ FIX: glt_states is indexed by BLOCK POSITION (init_states() appends
+        # a state per GLT block and None per anchor block), so state_idx must
+        # advance on EVERY block — not just GLT ones. The old GLT-only counting
+        # shifted every GLT layer after an anchor onto the anchor's None slot
+        # (and in ADL mode the restore then wiped the core's recurrent memory
+        # every token).
         for block in self.perception_blocks:
             if block.is_glt:
                 x, new_state = block.forward_glt(x, glt_states[state_idx])
@@ -364,6 +370,7 @@ class ContinuumModel(nn.Module):
                 wk, wv = block.mixer.update_window_cache(block_input, wk, wv)
                 window_caches[window_idx] = (wk, wv)
                 window_idx += 1
+                state_idx += 1  # ⚡ anchor blocks still occupy a glt_states slot (None)
 
         return x, glt_states, window_caches
 
@@ -406,6 +413,8 @@ class ContinuumModel(nn.Module):
         # ⚡ TRAINING FAST PATH: when n_loops_max <= 1, skip all ADL overhead
         if n_loops_max <= 1:
             # Single pass through core blocks (no halting, no ACT, no ponder)
+            # ⚡ FIX: state_idx advances on anchor blocks too (block-position
+            # indexing — see _run_stage_perception).
             for block in self.core_blocks:
                 if block.is_glt:
                     x, new_state = block.forward_glt(x, glt_states[state_idx])
@@ -417,6 +426,7 @@ class ContinuumModel(nn.Module):
                     wk, wv = block.mixer.update_window_cache(block_input, wk, wv)
                     window_caches[window_idx] = (wk, wv)
                     window_idx += 1
+                    state_idx += 1  # ⚡ anchor blocks still occupy a glt_states slot (None)
             n_loops = 1
             if self.training:
                 # ⚡ FIX: give the halting head a gradient even on the 1-loop
@@ -462,6 +472,8 @@ class ContinuumModel(nn.Module):
 
         for loop in range(n_loops_max):
             # Run core blocks (window caches intentionally NOT mutated here)
+            # ⚡ FIX: state_idx advances on anchor blocks too (block-position
+            # indexing — see _run_stage_perception).
             anchor_j = 0
             for j, block in enumerate(self.core_blocks):
                 if block.is_glt:
@@ -473,6 +485,7 @@ class ContinuumModel(nn.Module):
                     x, block_input = block.forward_anchor(x, wk, wv, pmb_readouts)
                     last_anchor_inputs[anchor_j] = block_input
                     anchor_j += 1
+                    state_idx += 1  # ⚡ anchor blocks still occupy a glt_states slot (None)
 
             if loop == 0:
                 first_pass_states = [
@@ -561,6 +574,8 @@ class ContinuumModel(nn.Module):
         window_idx = sum(1 for b in self.perception_blocks if b.is_anchor) + \
                      sum(1 for b in self.core_blocks if b.is_anchor)
 
+        # ⚡ FIX: state_idx advances on anchor blocks too (block-position
+        # indexing — see _run_stage_perception).
         for block in self.output_blocks:
             if block.is_glt:
                 x, new_state = block.forward_glt(x, glt_states[state_idx])
@@ -572,6 +587,7 @@ class ContinuumModel(nn.Module):
                 wk, wv = block.mixer.update_window_cache(block_input, wk, wv)
                 window_caches[window_idx] = (wk, wv)
                 window_idx += 1
+                state_idx += 1  # ⚡ anchor blocks still occupy a glt_states slot (None)
 
         return x, glt_states, window_caches
 
@@ -634,6 +650,9 @@ class ContinuumModel(nn.Module):
         # Lazy import to avoid circular dependency with training module
         from continuum.training.parallel_scan import glt_parallel_forward_with_state
         
+        # ⚡ FIX: state_idx must track BLOCK POSITION (init_states() indexes
+        # glt_states by block position, with None at anchor slots) — advance it
+        # on anchor blocks too, not just GLT ones.
         for block in block_list:
             if block.is_glt:
                 # ---- GLT: Parallel scan (O(log n)) ----
@@ -708,6 +727,7 @@ class ContinuumModel(nn.Module):
                     wv_new = torch.cat([pv, wv_new], dim=1)
                 window_caches[window_idx] = (wk_new, wv_new)
                 window_idx += 1
+                state_idx += 1  # ⚡ anchor blocks still occupy a glt_states slot (None)
 
                 x = o  # Anchor already includes residual
         
@@ -902,6 +922,22 @@ class ContinuumModel(nn.Module):
             total_loops = 0
             total_ponder = torch.tensor(0.0, device=device)
             core_outputs = []
+
+            # ⚡ FIX: zero the core anchors' window caches before the per-token
+            # loop. The parallel perception stage wrote the chunk's LAST ws
+            # tokens into them — those are FUTURE positions relative to the
+            # first tokens the core processes, so the core anchors leaked
+            # future context into training (~first ws positions of every
+            # sample). Fresh zero caches match the sequential forward()'s
+            # cold-start semantics; the loop fills them token by token.
+            _anchor_slot = core_window_start
+            for _block in self.core_blocks:
+                if _block.is_anchor:
+                    window_caches[_anchor_slot] = _block.mixer.init_window_cache(
+                        B, str(device), dtype
+                    )
+                    _anchor_slot += 1
+
             for t in range(seq_len):
                 xt = x[:, t, :]
                 xt, glt_states, window_caches, n_loops, ponder = self._run_stage_core(

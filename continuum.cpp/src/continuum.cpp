@@ -9,6 +9,7 @@
 
 #include "model.h"
 #include "sampler.h"
+#include "tokenizer.h"
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -18,14 +19,17 @@
 using namespace continuum;
 
 // ============================================================================
-// Inference engine: wraps model, state, arena, sampler
+// Inference engine: wraps model, state, arena, sampler, tokenizer
 // ============================================================================
 class ContinuumEngine {
     ModelWeights weights_;
     RuntimeState state_;
-    Arena arena_;
+    Arena arena_;      // persistent: model weights + recurrent state (NEVER reset)
+    Arena scratch_;    // per-token intermediates (rewind()'d every token)
     Sampler sampler_;
     SamplerConfig samp_cfg_;
+    BPETokenizer tokenizer_;
+    bool has_tokenizer_ = false;
     std::vector<int32_t> token_buf_;
 
     // Buffers
@@ -34,8 +38,24 @@ class ContinuumEngine {
     Tensor hidden_;
 
 public:
-    ContinuumEngine(size_t arena_mb = 512)
-        : arena_(arena_mb * 1024 * 1024) {}
+    ContinuumEngine(size_t arena_mb = 512, size_t scratch_mb = 64)
+        : arena_(arena_mb * 1024 * 1024), scratch_(scratch_mb * 1024 * 1024) {}
+
+    bool load_tokenizer(const std::string& path) {
+        if (tokenizer_.load(path)) {
+            has_tokenizer_ = true;
+            return true;
+        }
+        return false;
+    }
+
+    bool has_tokenizer() const { return has_tokenizer_; }
+
+    std::vector<int32_t> encode_prompt(const std::string& text) const {
+        return tokenizer_.encode(text, /*add_special=*/false);
+    }
+
+    void set_seed(int seed) { sampler_.set_seed(seed); }
 
     bool load(const std::string& path) {
         printf("Loading model from %s...\n", path.c_str());
@@ -254,21 +274,35 @@ public:
 
         // Prefill: process prompt tokens
         for (size_t p = 0; p < prompt_ids.size(); p++) {
-            embed_forward(token_embed_, prompt_ids[p], weights_.embed, arena_);
-            continuum_forward(logits_, state_, token_embed_, weights_, cfg, arena_);
+            scratch_.rewind();
+            embed_forward(token_embed_, prompt_ids[p], weights_.embed, scratch_);
+            continuum_forward(logits_, state_, token_embed_, weights_, cfg, scratch_);
         }
 
         // Generate
+        std::string result_text;
         int n_generated = 0;
         for (int i = 0; i < max_new_tokens; i++) {
+            scratch_.rewind();
             int32_t token = sampler_.sample(logits_, samp_cfg_);
             token_buf_.push_back(token);
             n_generated++;
 
+            // ⚡ FIX: decode real text. The old code returned "N tokens
+            // generated at X tok/s" instead of the model's output.
+            if (has_tokenizer_) {
+                result_text += tokenizer_.decode_token(token);
+            } else {
+                // Byte-level fallback: Python maps byte b -> token id b+3.
+                if (token >= 3 && token <= 258) {
+                    result_text += std::string(1, (char)(token - 3));
+                }
+            }
+
             if (token == cfg.eos_token_id) break;
 
-            embed_forward(token_embed_, token, weights_.embed, arena_);
-            continuum_forward(logits_, state_, token_embed_, weights_, cfg, arena_);
+            embed_forward(token_embed_, token, weights_.embed, scratch_);
+            continuum_forward(logits_, state_, token_embed_, weights_, cfg, scratch_);
         }
 
         auto t1 = std::chrono::high_resolution_clock::now();
@@ -276,9 +310,7 @@ public:
         double tps = n_generated / elapsed;
         printf("  Generated %d tokens in %.2fs (%.1f tok/s)\n", n_generated, elapsed, tps);
 
-        // Return as string
-        return std::to_string(n_generated) + " tokens generated at " +
-               std::to_string((int)tps) + " tok/s";
+        return result_text;
     }
 
     void reset() {
@@ -299,6 +331,7 @@ static void show_usage(const char* prog) {
     printf("  --top-p FLOAT     Nucleus sampling (default: 0.9)\n");
     printf("  --max-tokens INT  Max tokens to generate (default: 100)\n");
     printf("  --seed INT        Random seed (default: 42)\n");
+    printf("  --tokenizer PATH  tokenizer.bin for BPE encode/decode (default: none)\n");
     printf("  --help            Show this help\n");
 }
 
@@ -318,10 +351,12 @@ int main(int argc, char** argv) {
 
     std::string model_path = argv[1];
     std::string prompt = "Hello";
+    std::string tokenizer_path;
     float temp = 0.8f;
     int top_k = 40;
     float top_p = 0.9f;
     int max_tokens = 100;
+    int seed = 42;
 
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--prompt") == 0 && i + 1 < argc) prompt = argv[++i];
@@ -329,22 +364,41 @@ int main(int argc, char** argv) {
         else if (strcmp(argv[i], "--top-k") == 0 && i + 1 < argc) top_k = atoi(argv[++i]);
         else if (strcmp(argv[i], "--top-p") == 0 && i + 1 < argc) top_p = atof(argv[++i]);
         else if (strcmp(argv[i], "--max-tokens") == 0 && i + 1 < argc) max_tokens = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) seed = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--tokenizer") == 0 && i + 1 < argc) tokenizer_path = argv[++i];
     }
 
-    ContinuumEngine engine(1024);  // 1 GB arena
+    ContinuumEngine engine(1024, 64);  // 1 GB persistent + 64 MB scratch
 
     if (!engine.load(model_path)) {
         printf("Failed to load model.\n");
         return 1;
     }
 
+    // ⚡ FIX: --seed was documented but never parsed — runs were never
+    // reproducible.
+    engine.set_seed(seed);
     engine.set_temperature(temp);
     engine.set_top_k(top_k);
     engine.set_top_p(top_p);
 
-    // Simple ASCII tokenization (placeholder — real impl uses BPE tokenizer)
+    // ⚡ FIX: real BPE tokenization when tokenizer.bin is available. The old
+    // ASCII fallback fed RAW byte values as token IDs — but the BPE vocab
+    // maps byte b -> id b+3 (ids 0-2 are <pad>/<bos>/<eos>), so prompts were
+    // tokenized as garbage special tokens.
     std::vector<int32_t> prompt_ids;
-    for (char c : prompt) prompt_ids.push_back((int32_t)(unsigned char)c);
+    if (!tokenizer_path.empty()) {
+        if (engine.load_tokenizer(tokenizer_path)) {
+            prompt_ids = engine.encode_prompt(prompt);
+            printf("Tokenizer: %s\n", tokenizer_path.c_str());
+        } else {
+            printf("WARNING: could not load tokenizer %s — using byte fallback\n",
+                   tokenizer_path.c_str());
+        }
+    }
+    if (prompt_ids.empty()) {
+        for (char c : prompt) prompt_ids.push_back((int32_t)(unsigned char)c + 3);
+    }
 
     printf("Prompt: \"%s\"\n", prompt.c_str());
     std::string result = engine.generate(prompt_ids, max_tokens);

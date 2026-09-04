@@ -16,8 +16,16 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 from flask import Flask, render_template, request, Response, jsonify, stream_with_context
 from flask_cors import CORS
 
+from continuum.conversation.template import ChatTemplate
+
 app = Flask(__name__, template_folder="templates", static_folder="static")
 CORS(app)
+
+# System prompt used when formatting a fresh conversation.
+_SYSTEM_PROMPT = (
+    "You are Continuum, a helpful, harmless, and honest AI assistant. "
+    "You respond concisely and accurately."
+)
 
 # Lazy-loaded model
 _inference_engine = None
@@ -62,6 +70,43 @@ def _find_checkpoint():
     return None
 
 
+def _clamp_param(value, lo: float, hi: float, default: float):
+    """Clamp a user-supplied generation parameter into a safe range.
+
+    ⚡ FIX: API params were passed to the sampler unvalidated — a bad
+    temperature/top_k/top_p could crash or hang generation.
+    """
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return default
+    return max(lo, min(hi, v))
+
+
+def _format_chat_prompt(message: str, engine) -> str:
+    """Wrap the user message in the chat template (matches training data).
+
+    Multi-turn: send only the new turn — the engine's recurrent state already
+    holds the transcript (re-sending it would double-count history).
+    Cold start: system prompt + first user turn.
+    """
+    has_active_state = (
+        engine is not None
+        and getattr(engine, "glt_states", None) is not None
+        and len(getattr(engine, "conversation_tokens", [])) > 0
+    )
+    if has_active_state:
+        return (
+            f"{ChatTemplate.USER_TOKEN}\n{message}\n{ChatTemplate.END_TOKEN}\n"
+            f"{ChatTemplate.ASSISTANT_TOKEN}\n"
+        )
+    return (
+        f"{ChatTemplate.SYSTEM_TOKEN}\n{_SYSTEM_PROMPT}\n{ChatTemplate.END_TOKEN}\n"
+        f"{ChatTemplate.USER_TOKEN}\n{message}\n{ChatTemplate.END_TOKEN}\n"
+        f"{ChatTemplate.ASSISTANT_TOKEN}\n"
+    )
+
+
 def _find_tokenizer(vocab_size):
     """Load the repo's pretrained BPE tokenizer if present, else a fallback."""
     from continuum.tokenizer.bpe import ContinuumTokenizer
@@ -91,6 +136,13 @@ def get_model():
     forward path works.
     """
     global _inference_engine, _tokenizer, _model_loaded
+
+    # ⚡ FIX: --demo must REALLY force demo mode. It used to be cosmetic — the
+    # server still tried to load a model on the first request (slow, and it
+    # printed confusing warnings with an empty checkpoints/).
+    if os.environ.get("NEURON_DEMO", "0") == "1":
+        _model_loaded = True
+        return None, None
 
     if not _model_loaded:
         try:
@@ -168,10 +220,10 @@ def chat():
     """Non-streaming chat endpoint."""
     data = request.get_json()
     message = data.get("message", "").strip()
-    temperature = data.get("temperature", 0.8)
-    top_k = data.get("top_k", 40)
-    top_p = data.get("top_p", 0.9)
-    max_tokens = data.get("max_tokens", 256)
+    temperature = _clamp_param(data.get("temperature", 0.8), 0.01, 2.0, 0.8)
+    top_k = int(_clamp_param(data.get("top_k", 40), 1, 200, 40))
+    top_p = _clamp_param(data.get("top_p", 0.9), 0.05, 1.0, 0.9)
+    max_tokens = int(_clamp_param(data.get("max_tokens", 256), 1, 2048, 256))
 
     if not message:
         return jsonify({"error": "Empty message"}), 400
@@ -182,9 +234,10 @@ def chat():
         # Demo mode
         response_text = _demo_response(message)
     else:
+        prompt = _format_chat_prompt(message, engine)
         with _engine_lock:
             response_text = engine.generate(
-                message,
+                prompt,
                 max_new_tokens=max_tokens,
                 temperature=temperature,
                 top_k=top_k,
@@ -203,10 +256,10 @@ def chat_stream():
     """Streaming chat endpoint using Server-Sent Events."""
     data = request.get_json()
     message = data.get("message", "").strip()
-    temperature = data.get("temperature", 0.8)
-    top_k = data.get("top_k", 40)
-    top_p = data.get("top_p", 0.9)
-    max_tokens = data.get("max_tokens", 256)
+    temperature = _clamp_param(data.get("temperature", 0.8), 0.01, 2.0, 0.8)
+    top_k = int(_clamp_param(data.get("top_k", 40), 1, 200, 40))
+    top_p = _clamp_param(data.get("top_p", 0.9), 0.05, 1.0, 0.9)
+    max_tokens = int(_clamp_param(data.get("max_tokens", 256), 1, 2048, 256))
 
     if not message:
         return jsonify({"error": "Empty message"}), 400
@@ -222,9 +275,10 @@ def chat_stream():
                 time.sleep(0.05)
             yield f"data: {json.dumps({'token': '', 'done': True})}\n\n"
         else:
+            prompt = _format_chat_prompt(message, engine)
             with _engine_lock:
                 for token in engine.generate(
-                    message,
+                    prompt,
                     max_new_tokens=max_tokens,
                     temperature=temperature,
                     top_k=top_k,
@@ -249,7 +303,11 @@ def new_conversation():
     """Start a new conversation."""
     engine, _ = get_model()
     if engine:
-        msg = engine.start_conversation()
+        # ⚡ FIX: these endpoints mutate the engine's shared state (glt_states,
+        # conversation_tokens) — they must hold the same lock as generation,
+        # or a mid-stream /api/conversation/new would corrupt the context.
+        with _engine_lock:
+            msg = engine.start_conversation()
     else:
         msg = "New conversation started (demo mode)."
     return jsonify({"message": msg})
@@ -263,7 +321,8 @@ def save_conversation():
 
     engine, _ = get_model()
     if engine:
-        msg = engine.save_conversation(path)
+        with _engine_lock:
+            msg = engine.save_conversation(path)
     else:
         msg = "Demo mode: no state to save."
     return jsonify({"message": msg})
@@ -277,7 +336,8 @@ def resume_conversation():
 
     engine, _ = get_model()
     if engine:
-        msg = engine.resume_conversation(path)
+        with _engine_lock:
+            msg = engine.resume_conversation(path)
     else:
         msg = "Demo mode: no state to resume."
     return jsonify({"message": msg})
@@ -326,6 +386,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.demo:
+        os.environ["NEURON_DEMO"] = "1"
         print("Running in demo mode (UI only, no model).")
     else:
         print("Starting Continuum Chat Server...")

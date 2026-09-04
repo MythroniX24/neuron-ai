@@ -94,7 +94,9 @@ class EmailNotifier:
                     print(f"⚠️  Attachment not found: {filepath}")
 
         try:
-            with smtplib.SMTP(self.smtp_server, self.smtp_port) as server:
+            # ⚡ FIX: add a 30s timeout — a dead/unreachable SMTP server used to
+            # hang the whole training loop indefinitely.
+            with smtplib.SMTP(self.smtp_server, self.smtp_port, timeout=30) as server:
                 server.ehlo()
                 server.starttls()
                 server.ehlo()

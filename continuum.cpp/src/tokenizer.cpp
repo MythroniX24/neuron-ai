@@ -84,7 +84,10 @@ bool BPETokenizer::load(const std::string& path) {
         int32_t id = (int32_t)read_u32(f);
         std::string tok = read_str(f);
         special_tokens_[tok] = id;
-        if (tok == "<|eos|>") eos_id_ = id;
+        // ⚡ FIX: the Python exporter writes "<eos>" (not "<|eos|>") — without
+        // this, eos_id_ stayed at its default and decode() never filtered the
+        // EOS token out of generated text.
+        if (tok == "<|eos|>" || tok == "<eos>") eos_id_ = id;
         if (tok == "<|user|>") user_id_ = id;
         if (tok == "<|assistant|>") assistant_id_ = id;
         if (tok == "<|system|>") system_id_ = id;

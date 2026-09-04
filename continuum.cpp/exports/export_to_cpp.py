@@ -141,49 +141,64 @@ def export_model(model, output_path: str, quantize: str = "fp32"):
         write_tensor_quantized(f, emb.down_proj.weight.T, quantize)         # [d_model, d_embed]
         write_tensor(f, model.final_norm.scale)         # [d_model] — always FP32 (small)
 
-        # ─── GLT layers ───
+        # ─── Layer weights: collect per-block, write GROUPED ───
+        # ⚡ FIX: the C++ loaders (continuum.cpp / continuum_jni.cpp) read ALL
+        # GLT layers first, then ALL Anchor layers, then ALL FFN layers. The old
+        # exporter wrote blocks interleaved (GLT, FFN, Anchor, ...) so every
+        # .bin model loaded misaligned garbage (tensor sizes differ per type,
+        # so the file position drifted immediately). Write the exact order the
+        # loaders expect: GLTs in block order, anchors in block order, FFNs in
+        # block order (FFN i belongs to block i).
         all_blocks = (list(model.perception_blocks) +
                       list(model.core_blocks) +
                       list(model.output_blocks))
 
-        glt_idx = 0
-        anchor_idx = 0
-        ffn_idx = 0
+        glt_chunks: list = []
+        anchor_chunks: list = []
+        ffn_chunks: list = []
 
         for block in all_blocks:
             if block.is_glt:
                 mixer = block.mixer
-                write_tensor_quantized(f, mixer.W_k.weight.T, quantize)       # [d_state, d_model]
-                write_tensor_quantized(f, mixer.W_v.weight.T, quantize)
-                write_tensor_quantized(f, mixer.W_q.weight.T, quantize)
-                write_tensor_quantized(f, mixer.W_gamma.weight.T, quantize)
-                write_tensor(f, mixer.W_gamma.bias)        # [d_state] — small, always FP32
-                write_tensor_quantized(f, mixer.W_iota.weight.T, quantize)
-                write_tensor(f, mixer.W_iota.bias)         # small, FP32
-                write_tensor_quantized(f, mixer.W_r.weight.T, quantize)
-                write_tensor(f, mixer.W_r.bias)            # small, FP32
-                write_tensor_quantized(f, mixer.W_o.weight.T, quantize)        # [d_model, d_state]
-                write_tensor(f, mixer.norm.scale)           # [d_model] — FP32
-                write_tensor(f, mixer.kv_norm.scale)        # [d_state] — FP32
-                glt_idx += 1
+                glt_chunks.append([
+                    (mixer.W_k.weight.T, quantize),        # [d_state, d_model]
+                    (mixer.W_v.weight.T, quantize),
+                    (mixer.W_q.weight.T, quantize),
+                    (mixer.W_gamma.weight.T, quantize),
+                    (mixer.W_gamma.bias, "fp32"),           # [d_state] — small, always FP32
+                    (mixer.W_iota.weight.T, quantize),
+                    (mixer.W_iota.bias, "fp32"),
+                    (mixer.W_r.weight.T, quantize),
+                    (mixer.W_r.bias, "fp32"),
+                    (mixer.W_o.weight.T, quantize),          # [d_model, d_state]
+                    (mixer.norm.scale, "fp32"),             # [d_model] — FP32
+                    (mixer.kv_norm.scale, "fp32"),          # [d_state] — FP32
+                ])
             else:
                 mixer = block.mixer
-                write_tensor_quantized(f, mixer.W_qkv.weight.T, quantize)      # [q_dim+2*kv_dim, d_model]
-                write_tensor_quantized(f, mixer.W_o.weight.T, quantize)         # [d_model, q_dim]
-                write_tensor(f, mixer.static_anchors)       # [n_static, d_model] — FP32 (small)
-                write_tensor(f, mixer.alibi_slopes)         # [n_heads] — FP32
-                write_tensor(f, mixer.norm.scale)           # [d_model] — FP32
-                anchor_idx += 1
+                anchor_chunks.append([
+                    (mixer.W_qkv.weight.T, quantize),        # [q_dim+2*kv_dim, d_model]
+                    (mixer.W_o.weight.T, quantize),          # [d_model, q_dim]
+                    (mixer.static_anchors, "fp32"),         # [n_static, d_model] — FP32 (small)
+                    (mixer.alibi_slopes, "fp32"),           # [n_heads] — FP32
+                    (mixer.norm.scale, "fp32"),             # [d_model] — FP32
+                ])
 
             # FFN weights (every block has one) — large weights quantized
             ffn = block.ffn
-            write_tensor_quantized(f, ffn.gate_proj_fused.weight.T, quantize)  # [total_inter, d_model]
-            write_tensor_quantized(f, ffn.up_proj_fused.weight.T, quantize)
-            write_tensor_quantized(f, ffn.down_proj_fused.weight.T, quantize)  # [d_model, total_inter]
-            write_tensor(f, ffn.gate_head.weight.T)         # [n_shards, d_model] — FP32 (small)
-            write_tensor(f, ffn.gate_head.bias)             # [n_shards] — FP32
-            write_tensor(f, ffn.norm.scale)                 # [d_model] — FP32
-            ffn_idx += 1
+            ffn_chunks.append([
+                (ffn.gate_proj_fused.weight.T, quantize),   # [total_inter, d_model]
+                (ffn.up_proj_fused.weight.T, quantize),
+                (ffn.down_proj_fused.weight.T, quantize),   # [d_model, total_inter]
+                (ffn.gate_head.weight.T, "fp32"),           # [n_shards, d_model] — FP32 (small)
+                (ffn.gate_head.bias, "fp32"),               # [n_shards] — FP32
+                (ffn.norm.scale, "fp32"),                   # [d_model] — FP32
+            ])
+
+        # Write grouped: all GLTs, then all anchors, then all FFNs.
+        for chunk in glt_chunks + anchor_chunks + ffn_chunks:
+            for tensor, q in chunk:
+                write_tensor_quantized(f, tensor, q)
 
         # ─── Halting head (small, always FP32) ───
         hh = model.halting_head
@@ -200,7 +215,7 @@ def export_model(model, output_path: str, quantize: str = "fp32"):
 
     size_mb = os.path.getsize(output_path) / (1024 * 1024)
     print(f"✅ Exported to {output_path} ({size_mb:.1f} MB, {quantize.upper()})")
-    print(f"   GLT layers: {glt_idx}, Anchor: {anchor_idx}, FFN: {ffn_idx}")
+    print(f"   GLT layers: {len(glt_chunks)}, Anchor: {len(anchor_chunks)}, FFN: {len(ffn_chunks)}")
 
 
 def export_tokenizer(tokenizer, output_path: str):

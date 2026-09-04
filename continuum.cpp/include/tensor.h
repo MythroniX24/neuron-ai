@@ -253,6 +253,12 @@ public:
     }
 
     void reset() { offset = 0; memset(base, 0, size); }
+
+    // ⚡ FIX: rewind WITHOUT memset — used for the per-token scratch arena.
+    // Every scratch consumer writes its buffers before reading them, so
+    // stale bytes are harmless and we skip a multi-MB memset per token.
+    void rewind() { offset = 0; }
+
     size_t used() const { return offset; }
     size_t capacity() const { return size; }
 };

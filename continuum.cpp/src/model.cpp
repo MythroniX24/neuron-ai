@@ -682,31 +682,48 @@ void continuum_forward(
 
     int32_t glt_idx = 0, anchor_idx = 0;
 
-    // ─── Stage 1: Perception ───
+    // ⚡ FIX: replicate Python's _build_stage() layer-type interleaving EXACTLY.
+    // The old formulas ((l+1)%3 in perception, abs_l%3 in core/output) placed
+    // anchors at DIFFERENT positions than the Python model — core must use
+    // interval 2, and the final-layer fallback was missing — so the C++ engine
+    // applied the wrong GLT/Anchor weights to every block past the first anchor.
+    auto is_anchor_block = [&](int32_t abs_l, int32_t interval) -> bool {
+        if (anchor_idx < cfg.anchor_layers) {
+            if (glt_idx >= cfg.glt_layers) return true;
+            if ((abs_l + 1) % interval == 0) return true;
+            if (abs_l == cfg.n_layers - 1) return true;
+        }
+        return false;
+    };
+
+    // ─── Stage 1: Perception (anchor_interval=3) ───
     for (int32_t l = 0; l < cfg.perception_layers; l++) {
-        bool is_anchor = (anchor_idx < cfg.anchor_layers) &&
-                         ((l + 1) % 3 == 0 || glt_idx >= cfg.glt_layers);
+        bool is_anchor = is_anchor_block(l, 3);
+        if (is_anchor) anchor_idx++; else glt_idx++;
 
         auto tmp = arena.alloc_tensor(TensorShape(cfg.d_model));
 
         if (is_anchor) {
-            anchor_forward(tmp, state.window_k_caches[anchor_idx],
-                          state.window_v_caches[anchor_idx],
-                          x, state.window_k_caches[anchor_idx],
-                          state.window_v_caches[anchor_idx],
-                          pmb_proj_k[anchor_idx],  // ⚡ Projected PMB K!
-                          pmb_proj_v[anchor_idx],  // ⚡ Projected PMB V!
-                          weights.anchor_layers[anchor_idx],
-                          weights.anchor_layers[anchor_idx].static_k,
-                          weights.anchor_layers[anchor_idx].static_v,
+            anchor_forward(tmp, state.window_k_caches[anchor_idx - 1],
+                          state.window_v_caches[anchor_idx - 1],
+                          x, state.window_k_caches[anchor_idx - 1],
+                          state.window_v_caches[anchor_idx - 1],
+                          pmb_proj_k[anchor_idx - 1],  // ⚡ Projected PMB K!
+                          pmb_proj_v[anchor_idx - 1],  // ⚡ Projected PMB V!
+                          weights.anchor_layers[anchor_idx - 1],
+                          weights.anchor_layers[anchor_idx - 1].static_k,
+                          weights.anchor_layers[anchor_idx - 1].static_v,
                           false, arena);
-            anchor_idx++;
         } else {
             auto new_s = arena.alloc_tensor(TensorShape(cfg.d_state, cfg.d_state));
-            glt_forward(tmp, new_s, x, state.glt_states[glt_idx],
-                       weights.glt_layers[glt_idx], arena);
-            state.glt_states[glt_idx] = std::move(new_s);
-            glt_idx++;
+            glt_forward(tmp, new_s, x, state.glt_states[glt_idx - 1],
+                       weights.glt_layers[glt_idx - 1], arena);
+            // ⚡ FIX: copy into the PERSISTENT state tensor. The old code moved
+            // a scratch-arena tensor into the state list — with a per-token
+            // scratch arena (JNI fix) the moved tensor is rewind()'d on the
+            // next token, wiping the recurrent memory.
+            memcpy(state.glt_states[glt_idx - 1].data, new_s.data,
+                   state.glt_states[glt_idx - 1].n_elements() * sizeof(float));
         }
 
         auto tmp2 = arena.alloc_tensor(TensorShape(cfg.d_model));
@@ -744,31 +761,32 @@ void continuum_forward(
         anchor_idx = core_anchor_base;
 
         // Run core blocks (same logic as single-pass, but with reset indices)
+        // Core uses anchor_interval=2, matching Python's _build_stage.
         for (int32_t l = 0; l < cfg.core_layers; l++) {
             int32_t abs_l = cfg.perception_layers + l;
-            bool is_anchor = (anchor_idx < cfg.anchor_layers) &&
-                             (abs_l % 3 == 0 || glt_idx >= cfg.glt_layers);
+            bool is_anchor = is_anchor_block(abs_l, 2);
+            if (is_anchor) anchor_idx++; else glt_idx++;
 
             auto tmp = arena.alloc_tensor(TensorShape(cfg.d_model));
 
             if (is_anchor) {
-                anchor_forward(tmp, state.window_k_caches[anchor_idx],
-                              state.window_v_caches[anchor_idx],
-                              x, state.window_k_caches[anchor_idx],
-                              state.window_v_caches[anchor_idx],
-                              pmb_proj_k[anchor_idx],
-                              pmb_proj_v[anchor_idx],
-                              weights.anchor_layers[anchor_idx],
-                              weights.anchor_layers[anchor_idx].static_k,
-                              weights.anchor_layers[anchor_idx].static_v,
+                anchor_forward(tmp, state.window_k_caches[anchor_idx - 1],
+                              state.window_v_caches[anchor_idx - 1],
+                              x, state.window_k_caches[anchor_idx - 1],
+                              state.window_v_caches[anchor_idx - 1],
+                              pmb_proj_k[anchor_idx - 1],
+                              pmb_proj_v[anchor_idx - 1],
+                              weights.anchor_layers[anchor_idx - 1],
+                              weights.anchor_layers[anchor_idx - 1].static_k,
+                              weights.anchor_layers[anchor_idx - 1].static_v,
                               false, arena);
-                anchor_idx++;
             } else {
                 auto new_s = arena.alloc_tensor(TensorShape(cfg.d_state, cfg.d_state));
-                glt_forward(tmp, new_s, x, state.glt_states[glt_idx],
-                           weights.glt_layers[glt_idx], arena);
-                state.glt_states[glt_idx] = std::move(new_s);
-                glt_idx++;
+                glt_forward(tmp, new_s, x, state.glt_states[glt_idx - 1],
+                           weights.glt_layers[glt_idx - 1], arena);
+                // ⚡ FIX: copy into the PERSISTENT state tensor (see Stage 1).
+                memcpy(state.glt_states[glt_idx - 1].data, new_s.data,
+                       state.glt_states[glt_idx - 1].n_elements() * sizeof(float));
             }
 
             auto tmp2 = arena.alloc_tensor(TensorShape(cfg.d_model));
@@ -819,32 +837,32 @@ void continuum_forward(
     }
     // Single loop (n_loops == 1): just keep current x (no weighting needed)
 
-    // ─── Stage 3: Output ───
+    // ─── Stage 3: Output (anchor_interval=3) ───
     for (int32_t l = 0; l < cfg.output_layers; l++) {
         int32_t abs_l = cfg.perception_layers + cfg.core_layers + l;
-        bool is_anchor = (anchor_idx < cfg.anchor_layers) &&
-                         (abs_l % 3 == 0 || glt_idx >= cfg.glt_layers);
+        bool is_anchor = is_anchor_block(abs_l, 3);
+        if (is_anchor) anchor_idx++; else glt_idx++;
 
         auto tmp = arena.alloc_tensor(TensorShape(cfg.d_model));
 
         if (is_anchor) {
-            anchor_forward(tmp, state.window_k_caches[anchor_idx],
-                          state.window_v_caches[anchor_idx],
-                          x, state.window_k_caches[anchor_idx],
-                          state.window_v_caches[anchor_idx],
-                          pmb_proj_k[anchor_idx],  // ⚡ Projected PMB K!
-                          pmb_proj_v[anchor_idx],  // ⚡ Projected PMB V!
-                          weights.anchor_layers[anchor_idx],
-                          weights.anchor_layers[anchor_idx].static_k,
-                          weights.anchor_layers[anchor_idx].static_v,
+            anchor_forward(tmp, state.window_k_caches[anchor_idx - 1],
+                          state.window_v_caches[anchor_idx - 1],
+                          x, state.window_k_caches[anchor_idx - 1],
+                          state.window_v_caches[anchor_idx - 1],
+                          pmb_proj_k[anchor_idx - 1],  // ⚡ Projected PMB K!
+                          pmb_proj_v[anchor_idx - 1],  // ⚡ Projected PMB V!
+                          weights.anchor_layers[anchor_idx - 1],
+                          weights.anchor_layers[anchor_idx - 1].static_k,
+                          weights.anchor_layers[anchor_idx - 1].static_v,
                           false, arena);
-            anchor_idx++;
         } else {
             auto new_s = arena.alloc_tensor(TensorShape(cfg.d_state, cfg.d_state));
-            glt_forward(tmp, new_s, x, state.glt_states[glt_idx],
-                       weights.glt_layers[glt_idx], arena);
-            state.glt_states[glt_idx] = std::move(new_s);
-            glt_idx++;
+            glt_forward(tmp, new_s, x, state.glt_states[glt_idx - 1],
+                       weights.glt_layers[glt_idx - 1], arena);
+            // ⚡ FIX: copy into the PERSISTENT state tensor (see Stage 1).
+            memcpy(state.glt_states[glt_idx - 1].data, new_s.data,
+                   state.glt_states[glt_idx - 1].n_elements() * sizeof(float));
         }
 
         auto tmp2 = arena.alloc_tensor(TensorShape(cfg.d_model));

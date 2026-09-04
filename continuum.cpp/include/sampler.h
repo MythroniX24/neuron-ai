@@ -47,6 +47,10 @@ public:
         recent_tokens.clear();
     }
 
+    // ⚡ FIX: set the RNG seed explicitly (--seed CLI flag was documented
+    // but never parsed, so runs were never reproducible).
+    void set_seed(int seed) { rng.seed(seed); }
+
 private:
     void apply_repetition_penalty(Tensor& logits, const SamplerConfig& cfg);
     void apply_temperature(Tensor& logits, float temp);

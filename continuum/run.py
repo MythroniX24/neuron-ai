@@ -24,6 +24,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 def cmd_chat(args):
     """Launch the chat UI."""
+    # ⚡ FIX: --model and --demo were parsed but never used — the server always
+    # fell back to its own checkpoint discovery. Wire them through the env vars
+    # the UI already respects (NEURON_MODEL_PATH / NEURON_DEMO).
+    if args.demo:
+        os.environ["NEURON_DEMO"] = "1"
+    if args.model:
+        os.environ["NEURON_MODEL_PATH"] = args.model
     from continuum.ui.app import app
     print(f"Starting Continuum Chat on http://{args.host}:{args.port}")
     print("Open this URL on your phone to chat!")

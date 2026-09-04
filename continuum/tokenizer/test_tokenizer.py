@@ -194,6 +194,34 @@ def _load_pretrained():
     return ContinuumTokenizer.load(path)
 
 
+def test_training_never_learns_digit_merges():
+    """Train/serve consistency: BPE training must never LEARN a digit-digit
+    merge, because encode() refuses to APPLY them.
+
+    Previously train() preprocessed the corpus by inserting spaces around
+    digits (different preprocessing than encode()), so the same text produced
+    DIFFERENT token IDs at training vs inference time.
+    """
+    tok = ContinuumTokenizer(vocab_size=320)
+    tok.train([
+        "flight 123 to gate 45 at 6 pm",
+        "order 9876543210 today",
+        "the year is 2026 and the score is 42",
+    ] * 200, verbose=False)
+
+    # No learned merge may combine two single ASCII digits
+    for ba, bb in tok.merges:
+        a_digit = len(ba) == 1 and 0x30 <= ba[0] <= 0x39
+        b_digit = len(bb) == 1 and 0x30 <= bb[0] <= 0x39
+        assert not (a_digit and b_digit), \
+            f"learned digit-digit merge: {ba!r}+{bb!r}"
+
+    # Digits still encode as single tokens, and roundtrip stays lossless
+    ids = tok.encode("2026")
+    assert len(ids) == 4, f"'2026' should be 4 single-digit tokens, got {ids}"
+    assert tok.decode(ids) == "2026"
+
+
 def test_fast_encode_matches_reference():
     """New rank-based encode() must produce IDENTICAL output to the legacy
     scan-every-merge encoder on diverse inputs (numbers, unicode, repeats)."""
