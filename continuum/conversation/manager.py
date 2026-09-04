@@ -15,7 +15,13 @@ from typing import Dict, Optional, Generator
 
 from continuum.conversation.template import ChatTemplate, Conversation, Message, Role
 from continuum.model.model import ContinuumModel
-from continuum.inference.engine import ContinuumInference
+# ⚡ FIX: ContinuumInference is imported LAZILY inside __init__ (see below).
+# engine.py imports continuum.conversation.template at module level, so a
+# top-level `from continuum.inference.engine import ContinuumInference` here
+# created a circular import that failed whenever continuum.inference was
+# imported first (e.g. pytest collecting inference/test_engine.py):
+#   ImportError: cannot import name 'ContinuumInference' from partially
+#   initialized module 'continuum.inference.engine'
 
 
 class ConversationManager:
@@ -72,7 +78,9 @@ class ConversationManager:
         self.max_history_turns = max_history_turns
         self.max_context_length = max_context_length
         
-        # Create inference engine
+        # Create inference engine (lazy import — breaks the module-level
+        # circular import between engine.py and the conversation package)
+        from continuum.inference.engine import ContinuumInference
         self.engine = ContinuumInference(
             model=model,
             tokenizer=tokenizer,
