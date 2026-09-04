@@ -157,7 +157,11 @@ def test_scan_gradient_checkpointing_matches_plain():
         model._ckpt_scan = with_ckpt
         out = model.forward_parallel(ids, core_max_loops=1)
         out["logits"].float().pow(2).mean().backward()
-        return out["logits"], [p.grad.clone() for p in model.parameters()]
+        # Some params (e.g. FFN gate_head) don't feed a pure-logits loss and
+        # keep grad=None — collect clones-or-None and compare below.
+        return out["logits"], [
+            None if p.grad is None else p.grad.clone() for p in model.parameters()
+        ]
 
     logits_ckpt, grads_ckpt = run(True)
     logits_plain, grads_plain = run(False)
