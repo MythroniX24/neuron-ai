@@ -590,6 +590,26 @@ def test_vision_encoder_no_nan():
     print("✓ ContinuumVisionEncoder: no NaN/Inf over 5 random inputs")
 
 
+def _grid_preserving_subsample_count(H_p, W_p, max_patches):
+    """Expected patch count after the encoder's grid-preserving cap.
+
+    Mirrors ContinuumVisionEncoder.forward(): keep whole rows/columns at a
+    stride that stays rectangular (flat every-step-th slicing would break the
+    2D grid RoPE expects).
+    """
+    N = H_p * W_p
+    if N <= max_patches:
+        return N
+    col_step = max(1, math.ceil(W_p / max(1, round(math.sqrt(max_patches * W_p / max(H_p, 1))))))
+    row_step = max(1, math.ceil(H_p / max(1, round(math.sqrt(max_patches * H_p / max(W_p, 1))))))
+    keep_cols = list(range(0, W_p, col_step))
+    keep_rows = list(range(0, H_p, row_step))
+    # hard cap: trim whole rows first if still over budget
+    while len(keep_rows) * len(keep_cols) > max_patches and len(keep_rows) > 1:
+        keep_rows = keep_rows[:-1]
+    return len(keep_rows) * len(keep_cols)
+
+
 def test_vision_encoder_variable_image_sizes():
     """Test encoder with different image sizes (not just 224×224)."""
     cfg = ContinuumVisionConfig(
@@ -604,14 +624,14 @@ def test_vision_encoder_variable_image_sizes():
         H, W = size
         img = torch.randn(1, 3, H, W)
         tokens = encoder(img)
-        # Expected count includes the mobile max_patches subsampling cap:
-        # N > max_patches → keep every step-th patch.
-        N = (H // 16) * (W // 16)
-        step = math.ceil(N / max_patches)
-        expected_N = len(range(0, N, step)) if step > 1 else N
+        # Grid-preserving subsampling cap (keeps the 2D grid rectangular for
+        # RoPE) — NOT the old flat every-step-th slice.
+        H_p, W_p = H // 16, W // 16
+        expected_N = _grid_preserving_subsample_count(H_p, W_p, max_patches)
         assert tokens.shape[0] == 1
         assert tokens.shape[1] == expected_N, \
             f"Size {(H,W)}: expected {expected_N} patches (after max_patches={max_patches} cap), got {tokens.shape[1]}"
+        assert tokens.shape[1] <= max_patches
         assert tokens.shape[2] == 192
         assert not torch.isnan(tokens).any()
     print("✓ ContinuumVisionEncoder: variable image sizes supported")

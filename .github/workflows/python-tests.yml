@@ -44,13 +44,13 @@ jobs:
         run: |
           set +e
           python -m pytest model/ inference/ tokenizer/ conversation/ \
-            -v --tb=line --no-header --maxfail=3 > /tmp/pytest_out.txt 2>&1
+            -q --tb=line --no-header --maxfail=3 > /tmp/pytest_out.txt 2>&1
           rc=$?
           if [ $rc -ne 0 ]; then
-            # Surface the failure as GitHub annotations (publicly readable).
-            # GitHub caps annotations at 10, so emit only the final summary
-            # lines where pytest lists the FAILED tests + reason.
-            grep -v '^$' /tmp/pytest_out.txt | tail -10 | sed 's/^/::error::/'
+            # Surface failures as GitHub annotations (publicly readable).
+            # GitHub caps annotations at 10, so emit ONLY the FAILED summary
+            # lines pytest prints at the end (test name + reason).
+            grep '^FAILED' /tmp/pytest_out.txt | sed 's/^/::error::/' | head -10
             exit $rc
           fi
 
