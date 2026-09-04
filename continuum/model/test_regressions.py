@@ -29,9 +29,13 @@ from continuum.model.model import create_continuum_nano, create_continuum_max
 def test_core_glt_state_survives_adl_forward():
     """ADL-mode forward must leave the core GLT recurrent state intact.
 
-    Bug: with an anchor before a GLT in the core stage (nano: blocks
-    [Anchor, GLT]), the core GLT read the anchor's None slot and the ADL
-    restore reset it every token.
+    Bug: glt_states is indexed by BLOCK POSITION (anchors hold None slots),
+    but the stage runners used to address it by GLT-count. Whenever an anchor
+    precedes a GLT inside a stage (e.g. max-tier core [GLT, Anchor, GLT] or
+    perception [GLT, GLT, Anchor, GLT]) the GLTs after the anchor read the
+    wrong slot — and in ADL inference the first-pass restore then wiped the
+    core's recurrent memory to None every token, so the reasoning core had
+    no cross-token memory.
     """
     model = create_continuum_nano()
     model.eval()
@@ -68,7 +72,10 @@ def test_forward_parallel_core_attends_no_future_tokens():
     model.eval()
 
     core_anchor_mixers = [b.mixer for b in model.core_blocks if b.is_anchor]
-    assert core_anchor_mixers, "test assumes an anchor layer inside the core stage"
+    assert core_anchor_mixers, (
+        "test assumes an anchor layer inside the core stage "
+        "(nano core is [GLT, Anchor])"
+    )
 
     first_call_window_norm = {"value": None}
 

@@ -234,6 +234,17 @@ class ContinuumModel(nn.Module):
         )
 
         # ---- Build stages ----
+        # ⚡ FIX: GLT/Anchor placement counters accumulate across ALL stages.
+        # _build_stage() used to recount from its own (always-empty) stage
+        # list, so every stage restarted from zero: intervals were evaluated
+        # at the wrong absolute positions, the Reasoning Core (interval 2)
+        # could never contain an anchor layer, and the small/medium tiers
+        # silently violated their glt_layers/anchor_layers count contract.
+        # The C++ port always derived positions from the ENTIRE model (as the
+        # docstring below promises) — this aligns Python with it.
+        self._glt_built = 0
+        self._anchor_built = 0
+
         # Stage 1: Perception (anchor_interval=3)
         self.perception_blocks = nn.ModuleList()
         self._build_stage(config.perception_layers, self.perception_blocks, is_perception_or_output=True)
@@ -290,27 +301,26 @@ class ContinuumModel(nn.Module):
                                      if False (Core), use anchor_interval=2
         """
         config = self.config
-
-        # Count existing GLT/Anchor in blocks already built across all stages
-        existing_glt = sum(1 for b in block_list if b.is_glt)
-        existing_anchor = sum(1 for b in block_list if b.is_anchor)
-
         anchor_interval = 3 if is_perception_or_output else 2
 
+        # Absolute index of this stage's FIRST block within the whole model
+        # (the interval pattern is evaluated against the global layer
+        # position, exactly like the C++ port's abs_l = stage_start + l).
+        stage_abs_base = self._glt_built + self._anchor_built
+
         for i in range(n_layers):
-            # Compute absolute layer index across entire model
-            abs_idx = existing_glt + existing_anchor + i
+            abs_idx = stage_abs_base + i
 
             # Decide layer type based on simple interleaving:
             # Anchor if: still need more anchors AND
             #   (GLT budget exhausted, OR interval matches, OR this is the last layer overall and we still have anchors left)
             use_anchor = False
-            if existing_anchor < config.anchor_layers:
-                if existing_glt >= config.glt_layers:
+            if self._anchor_built < config.anchor_layers:
+                if self._glt_built >= config.glt_layers:
                     use_anchor = True
                 elif (abs_idx + 1) % anchor_interval == 0:
                     use_anchor = True
-                elif abs_idx == config.n_layers - 1 and existing_anchor + 1 <= config.anchor_layers:
+                elif abs_idx == config.n_layers - 1 and self._anchor_built + 1 <= config.anchor_layers:
                     use_anchor = True
 
             if use_anchor:
@@ -323,14 +333,14 @@ class ContinuumModel(nn.Module):
                     n_static_anchors=config.n_static_anchors,
                     dropout=config.dropout,
                 )
-                existing_anchor += 1
+                self._anchor_built += 1
             else:
                 mixer = GLTLayer(
                     d_model=config.d_model,
                     d_state=config.d_state,
                     dropout=config.dropout,
                 )
-                existing_glt += 1
+                self._glt_built += 1
 
             ffn = GatedShardFFN(
                 d_model=config.d_model,
