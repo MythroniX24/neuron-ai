@@ -42,8 +42,15 @@ jobs:
       - name: Run full unit test suite (failures fail the build)
         working-directory: continuum
         run: |
+          set +e
           python -m pytest model/ inference/ tokenizer/ conversation/ \
-            -v --tb=short --no-header --maxfail=3
+            -v --tb=short --no-header --maxfail=3 > /tmp/pytest_out.txt 2>&1
+          rc=$?
+          if [ $rc -ne 0 ]; then
+            # Surface the failure as GitHub annotations (publicly readable)
+            tail -120 /tmp/pytest_out.txt | sed 's/^/::error::/'
+            exit $rc
+          fi
 
       - name: Verify model forward + state-carry regression
         run: |

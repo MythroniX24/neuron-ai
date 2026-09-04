@@ -82,7 +82,10 @@ def test_forward_parallel_core_attends_no_future_tokens():
     mm.TransformerBlock.forward_anchor = spy
     try:
         with torch.no_grad():
-            model.forward_parallel(torch.randint(0, 8000, (1, 64)), core_max_loops=1)
+            # NOTE: core_max_loops=None (full ADL) — the leak lives in the
+            # PER-TOKEN core loop; with core_max_loops=1 the core runs a fully
+            # parallel stage that never reads the window caches at all.
+            model.forward_parallel(torch.randint(0, 8000, (1, 64)))
     finally:
         mm.TransformerBlock.forward_anchor = orig
 
