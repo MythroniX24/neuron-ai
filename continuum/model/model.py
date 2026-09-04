@@ -700,13 +700,11 @@ class ContinuumModel(nn.Module):
                 D = block.mixer.d_state
                 B, L, _ = x_norm.shape
 
-                # FIX (T4 OOM): the full scan's autograd graph retains ~8
-                # [B, L, D, D] round-buffers PER GLT LAYER. Once that total
-                # would crowd the GPU, gradient-checkpoint the mixer branch:
-                # intermediates are recomputed in backward instead of retained
-                # (peak memory drops ~3x at the L=96 / batch-24 curriculum
-                # end). Smaller shapes keep the fast uncheckpointed path.
-                _est_bytes = (8.0 * B * L * D * D
+                # The O(L^2) einsum scan retains ~3 broadcast [B,L,L,D]
+                # readout tensors per layer — far smaller than the old
+                # [B,L,D,D] scan graph. Checkpointing is now only a safety
+                # net for extreme shapes.
+                _est_bytes = (3.0 * B * L * L * D
                               * (2 if x_norm.dtype == torch.float16 else 4)
                               * self.config.glt_layers)
                 _use_ckpt = bool(

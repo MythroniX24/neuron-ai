@@ -184,3 +184,75 @@ def test_scan_gradient_checkpointing_matches_plain():
             f"checkpointed gradient drift on {name}: "
             f"max diff {(gc - gp).abs().max().item():.6f}"
         )
+
+
+def test_parallel_scan_matches_sequential_reference():
+    """The O(L^2) einsum scan must reproduce the sequential GLT recurrence
+    EXACTLY (outputs AND gradients) — it replaced the Kogge-Stone
+    implementation that dominated T4 training steps (~850 ms/step)."""
+    import torch as _t
+    from continuum.training.parallel_scan import (
+        glt_parallel_forward_with_state,
+        glt_sequential_forward,
+    )
+    _t.manual_seed(0)
+    B, L, D = 2, 33, 24  # odd L exercises arbitrary-length behavior
+    r = _t.sigmoid(_t.randn(B, L, D))
+    Wo = _t.randn(D, D)
+
+    def make_params():
+        return [
+            _t.randn(B, L, D, requires_grad=True),        # k
+            _t.randn(B, L, D, requires_grad=True),        # v
+            _t.randn(B, L, D, requires_grad=True),        # q
+            _t.sigmoid(_t.randn(B, L, D, requires_grad=True)),  # gamma
+            _t.sigmoid(_t.randn(B, L, D, requires_grad=True)),  # iota
+        ]
+
+    p_p, p_s = make_params(), make_params()
+
+    k, v, q, gamma, iota = p_p
+    o_p, fs_p = glt_parallel_forward_with_state(k, v, q, gamma, iota, r, Wo)
+    (o_p.sum() + fs_p.sum()).backward()
+    g_p = [pp.grad.clone() for pp in p_p]
+
+    k, v, q, gamma, iota = p_s
+    o_s = glt_sequential_forward(k, v, q, gamma, iota, r, Wo)
+    o_s.sum().backward()
+    g_s = [pp.grad.clone() for pp in p_s]
+
+    max_o = (o_p - o_s).abs().max().item()
+    assert _t.allclose(o_p, o_s, atol=1e-5, rtol=1e-4), (
+        f"einsum scan output drift vs sequential: max diff {max_o:.6f}"
+    )
+    for name, gc, gs in zip(("k", "v", "q", "gamma", "iota"), g_p, g_s):
+        assert _t.allclose(gc, gs, atol=1e-5, rtol=1e-4), (
+            f"einsum scan grad drift on {name}: "
+            f"max diff {(gc - gs).abs().max().item():.6f}"
+        )
+
+    # Final state parity: recompute the recurrence manually to completion.
+    with _t.no_grad():
+        S = _t.zeros(B, D, D)
+        for t in range(L):
+            S = (gamma[:, t, :].unsqueeze(2) * S
+                 + iota[:, t, :].unsqueeze(2)
+                 * (k[:, t, :].unsqueeze(2) @ v[:, t, :].unsqueeze(1)))
+    assert _t.allclose(fs_p, S, atol=1e-5, rtol=1e-4), (
+        f"einsum final_state drift: max diff {(fs_p - S).abs().max().item():.6f}"
+    )
+
+    # Initial-state parity vs the (independent, fp32) chunked path.
+    p_c = make_params()
+    S0 = _t.randn(B, D, D)
+    o_c, fs_c = glt_parallel_forward_with_state(*p_c, r, Wo,
+                                                initial_state=S0, chunk_size=16)
+    o_f, fs_f = glt_parallel_forward_with_state(*p_c, r, Wo, initial_state=S0)
+    assert _t.allclose(o_f, o_c, atol=1e-5, rtol=1e-4), (
+        f"einsum+initial_state output drift vs chunked: "
+        f"max diff {(o_f - o_c).abs().max().item():.6f}"
+    )
+    assert _t.allclose(fs_f, fs_c, atol=1e-5, rtol=1e-4), (
+        f"einsum+initial_state final_state drift vs chunked: "
+        f"max diff {(fs_f - fs_c).abs().max().item():.6f}"
+    )
