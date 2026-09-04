@@ -76,6 +76,10 @@ class ContinuumTrainer:
             # faster kernels for the entire run.
             torch.backends.cudnn.benchmark = True
         self.use_parallel_forward = use_parallel_forward
+        # ⚡ FIX: store the flag — the notebook checks
+        # trainer.use_gradient_checkpointing at train time, but the
+        # attribute was never assigned (AttributeError crash).
+        self.use_gradient_checkpointing = use_gradient_checkpointing
 
         # ⚡ Phase 8: Gradient checkpointing for FactorizedEmbedding
         # The embedding output is [B, L, d_model] which is large.
