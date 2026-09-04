@@ -51,6 +51,13 @@ jobs:
             # GitHub caps annotations at 10, so emit ONLY the FAILED summary
             # lines pytest prints at the end (test name + reason).
             grep '^FAILED' /tmp/pytest_out.txt | sed 's/^/::error::/' | head -10
+            # Then re-run the first failing test with a short traceback and
+            # emit its TOP frames (outermost = our test/model code first).
+            failed=$(grep '^FAILED' /tmp/pytest_out.txt | awk '{print $2}' | head -1)
+            if [ -n "$failed" ]; then
+              python -m pytest "$failed" -x --tb=short --no-header -q 2>&1 \
+                | head -14 | sed 's/^/::error::/'
+            fi
             exit $rc
           fi
 
