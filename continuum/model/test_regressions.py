@@ -209,15 +209,20 @@ def test_parallel_scan_matches_sequential_reference():
             _t.sigmoid(_t.randn(B, L, D, requires_grad=True)),  # iota
         ]
 
-    p_p, p_s = make_params(), make_params()
+    def fresh(vals):
+        """Fresh leaf tensors with the SAME values (both paths must consume
+        identical inputs; each path needs its own leaves for backward)."""
+        return [v.detach().clone().requires_grad_(True) for v in vals]
 
-    k, v, q, gamma, iota = p_p
-    o_p, fs_p = glt_parallel_forward_with_state(k, v, q, gamma, iota, r, Wo)
+    base = make_params()  # shared VALUES — not tensors fed to both graphs
+
+    p_p = fresh(base)
+    o_p, fs_p = glt_parallel_forward_with_state(*p_p, r, Wo)
     (o_p.sum() + fs_p.sum()).backward()
     g_p = [None if pp.grad is None else pp.grad.clone() for pp in p_p]
 
-    k, v, q, gamma, iota = p_s
-    o_s = glt_sequential_forward(k, v, q, gamma, iota, r, Wo)
+    p_s = fresh(base)
+    o_s = glt_sequential_forward(*p_s, r, Wo)
     o_s.sum().backward()
     g_s = [None if pp.grad is None else pp.grad.clone() for pp in p_s]
 
@@ -233,18 +238,21 @@ def test_parallel_scan_matches_sequential_reference():
         )
 
     # Final state parity: recompute the recurrence manually to completion.
+    # (k, v, gamma, iota below are the *base* tensors via p_p/p_s values.)
     with _t.no_grad():
+        kb, vb, qb, gb, ib = base
         S = _t.zeros(B, D, D)
         for t in range(L):
-            S = (gamma[:, t, :].unsqueeze(2) * S
-                 + iota[:, t, :].unsqueeze(2)
-                 * (k[:, t, :].unsqueeze(2) @ v[:, t, :].unsqueeze(1)))
+            S = (gb[:, t, :].unsqueeze(2) * S
+                 + ib[:, t, :].unsqueeze(2)
+                 * (kb[:, t, :].unsqueeze(2) @ vb[:, t, :].unsqueeze(1)))
     assert _t.allclose(fs_p, S, atol=1e-5, rtol=1e-4), (
         f"einsum final_state drift: max diff {(fs_p - S).abs().max().item():.6f}"
     )
 
-    # Initial-state parity vs the (independent, fp32) chunked path.
-    p_c = make_params()
+    # Initial-state parity vs the (independent, fp32) chunked path — both
+    # consume the SAME tensors (no backward on this section).
+    p_c = fresh(base)
     S0 = _t.randn(B, D, D)
     o_c, fs_c = glt_parallel_forward_with_state(*p_c, r, Wo,
                                                 initial_state=S0, chunk_size=16)

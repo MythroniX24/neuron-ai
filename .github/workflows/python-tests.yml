@@ -57,6 +57,8 @@ jobs:
             # S_t = gamma_t*S_{t-1} + iota_t*(k_t x v_t). Whichever matches the
             # loop reference is "right"; the one that disagrees is at fault.
             python - <<'PYEOF' 2>&1 | sed 's/^/::error::/' | head -12
+          import sys
+          sys.path.insert(0, '..')
           import torch
           from continuum.training.parallel_scan import (
               glt_sequential_forward, _glt_scan_einsum_with_state,
