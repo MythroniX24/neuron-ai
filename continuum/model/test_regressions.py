@@ -168,6 +168,14 @@ def test_scan_gradient_checkpointing_matches_plain():
     )
     names = [n for n, _ in model.named_parameters()]
     for name, gc, gp in zip(names, grads_ckpt, grads_plain):
+        if gc is None or gp is None:
+            # Params untouched by this input keep grad=None (set_to_none) in
+            # BOTH runs — that must agree.
+            assert gc is None and gp is None, (
+                f"gradient presence differs on {name} "
+                f"(ckpt={gc is not None}, plain={gp is not None})"
+            )
+            continue
         assert torch.allclose(gc, gp, atol=1e-5, rtol=1e-4), (
             f"checkpointed gradient drift on {name}: "
             f"max diff {(gc - gp).abs().max().item():.6f}"
