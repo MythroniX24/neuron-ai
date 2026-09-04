@@ -57,6 +57,32 @@ jobs:
             if [ -n "$failed" ]; then
               python -m pytest "$failed" -x --tb=short --no-header -q 2>&1 \
                 | head -14 | sed 's/^/::error::/'
+              # GLT scan cross-check: einsum vs chunked vs sequential (three
+              # independent implementations) — tells us WHICH one diverges.
+              cd ..
+              python - <<'DBG' 2>&1 | head -20 | sed 's/^/::error::/'
+import torch
+from continuum.training.parallel_scan import (
+    glt_sequential_forward, _glt_scan_einsum_with_state,
+    _compute_chunked_outer_product_and_scan,
+)
+torch.manual_seed(0)
+B, L, D = 2, 33, 24
+r = torch.sigmoid(torch.randn(B, L, D)); Wo = torch.randn(D, D)
+k = torch.randn(B, L, D); v = torch.randn(B, L, D); q = torch.randn(B, L, D)
+gamma = torch.sigmoid(torch.randn(B, L, D)); iota = torch.sigmoid(torch.randn(B, L, D))
+h_e, fs_e = _glt_scan_einsum_with_state(k, v, q, gamma, iota)
+h_c, fs_c = _compute_chunked_outer_product_and_scan(k, v, q, gamma, iota, chunk_size=16)
+o_s = glt_sequential_forward(k, v, q, gamma, iota, r, Wo)
+o_c = r * h_c @ Wo.T
+o_e = r * h_e @ Wo.T
+print('torch', torch.__version__)
+print('h einsum vs chunked :', (h_e - h_c).abs().max().item())
+print('fs einsum vs chunked:', (fs_e - fs_c).abs().max().item())
+print('o einsum vs sequential:', (o_e - o_s).abs().max().item())
+print('o chunked vs sequential:', (o_c - o_s).abs().max().item())
+DBG
+              cd continuum
             fi
             exit $rc
           fi
