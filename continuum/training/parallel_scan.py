@@ -276,23 +276,31 @@ def _glt_scan_einsum_with_state(
     # v_j · q_t scores — [B, L, L] batched matmul
     scores = torch.einsum("bld,btd->blt", v, q)
 
-    # Decay prefix products in fp32: gamma chains underflow fp16 long before
-    # their contribution matters, and fp32 keeps the P_t/P_j ratios accurate.
-    P = torch.cumprod(gamma.to(torch.float32), dim=1)  # [B, L, D] fp32
-    # P_t / P_j <= 1 always (gamma <= 1) — bounded and stable. Only the fp16
-    # result is retained for backward: autograd saves the cast's input P
-    # ([B, L, D]), not the broadcast [B, L, L, D] division intermediate.
-    R = (P.unsqueeze(2) / P.unsqueeze(1)).clamp(max=1.0).to(dtype)  # [B, L, L, D]
+    # Decay chains R[b,j,t,d] = Π_{m=j+1..t} gamma[b,m,d], built with a
+    # causal-masked cumulative product along t — NO division. A prefix
+    # product P_t/P_j would hit exact 0/0 = NaN whenever a long chain of
+    # small gamma underflows fp32 to zero (CI caught this: non-finite
+    # logits), whereas a cumprod decay that underflows to 0 is simply
+    # "fully decayed" — the correct semantics. Values are in [0, 1].
+    L = gamma.shape[1]
+    g = gamma.unsqueeze(1)  # [B, 1, L, D]
+    j_idx = torch.arange(L, device=gamma.device)
+    causal = j_idx.unsqueeze(1) < j_idx.unsqueeze(0)  # [L, L] m > j
+    M = torch.where(causal.unsqueeze(0).unsqueeze(-1), g, torch.ones_like(g))
+    R = M.cumprod(dim=2)  # [B, L, L, D]
 
     # h[b,t,d] = Σ_j (iota_j ⊙ k_j)[b,j,d] · R[b,j,t,d] · scores[b,j,t]
     term = R * scores.unsqueeze(-1) * (k * iota).unsqueeze(2)  # [B, L, L, D]
     h = term.sum(dim=1)  # [B, L, D]
 
-    # Final recurrent state: S_L = P_L ⊙ S_0 + Σ_j (P_L/P_j) ⊙ iota_j ⊙ (k_j ⊗ v_j)
-    RL = R[:, :, -1, :]  # [B, L, D] — decay from position j+1..L (== P_L/P_j)
+    # Final recurrent state: S_L = Σ_j R[:,j,L,:] ⊙ iota_j ⊙ (k_j ⊗ v_j)
+    RL = R[:, :, -1, :]  # [B, L, D] — decay from position j+1..L
     final_state = torch.einsum("bld,ble->bde", RL * iota * k, v)  # [B, D, D]
 
     if initial_state is not None:
+        # S_0 term: P_t ⊙ (S_0 @ q_t), P_t = Π_{m<=t} gamma_m (fp32 cumprod;
+        # underflow to 0 = fully decayed, which is correct).
+        P = torch.cumprod(gamma.to(torch.float32), dim=1)  # [B, L, D] fp32
         h0 = torch.einsum("bde,bte->btd", initial_state.to(dtype), q)
         h = h + P.to(dtype) * h0
         final_state = final_state + P[:, -1, :].unsqueeze(-1) * initial_state.to(dtype)

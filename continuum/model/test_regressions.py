@@ -214,18 +214,19 @@ def test_parallel_scan_matches_sequential_reference():
     k, v, q, gamma, iota = p_p
     o_p, fs_p = glt_parallel_forward_with_state(k, v, q, gamma, iota, r, Wo)
     (o_p.sum() + fs_p.sum()).backward()
-    g_p = [pp.grad.clone() for pp in p_p]
+    g_p = [None if pp.grad is None else pp.grad.clone() for pp in p_p]
 
     k, v, q, gamma, iota = p_s
     o_s = glt_sequential_forward(k, v, q, gamma, iota, r, Wo)
     o_s.sum().backward()
-    g_s = [pp.grad.clone() for pp in p_s]
+    g_s = [None if pp.grad is None else pp.grad.clone() for pp in p_s]
 
     max_o = (o_p - o_s).abs().max().item()
     assert _t.allclose(o_p, o_s, atol=1e-5, rtol=1e-4), (
         f"einsum scan output drift vs sequential: max diff {max_o:.6f}"
     )
     for name, gc, gs in zip(("k", "v", "q", "gamma", "iota"), g_p, g_s):
+        assert gc is not None and gs is not None, f"missing grad on {name}"
         assert _t.allclose(gc, gs, atol=1e-5, rtol=1e-4), (
             f"einsum scan grad drift on {name}: "
             f"max diff {(gc - gs).abs().max().item():.6f}"
