@@ -681,8 +681,14 @@ class ContinuumModel(nn.Module):
                 r_gate = torch.sigmoid(block.mixer.W_r(x_norm))
                 
                 # Parallel scan: O(log L) instead of O(L)
-                # ⚡ Chunked scan on CUDA: reduces peak VRAM from [B,L,D,D] to [B,32,D,D]
-                _scan_chunk = 32 if k.is_cuda and L > 32 else None
+                # ⚡ Chunked scan on CUDA: reduces peak VRAM from [B,L,D,D] to [B,32,D,D].
+                # ⚡ FIX: only chunk when the full-scan autograd graph would actually
+                # exceed ~4 GB (estimate ~8x the fp32 [B,L,D,D] outer product). The
+                # old fixed rule chunked every L>32 — at training batch 16-64 / L<=128
+                # the full path fits a 16 GB T4 easily and avoids the per-chunk fp32
+                # casts + doubled kernel launches that made steps ~2x slower.
+                _est_bytes = 8.0 * k.shape[0] * L * k.shape[-1] * k.shape[-1] * 4
+                _scan_chunk = 32 if (k.is_cuda and _est_bytes > 4e9) else None
                 o, final_state = glt_parallel_forward_with_state(
                     k, v, q, gamma, iota, r_gate, block.mixer.W_o.weight,
                     chunk_size=_scan_chunk,
