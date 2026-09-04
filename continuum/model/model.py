@@ -7,6 +7,7 @@ Implements Sections 8, 9, and 16 of the architecture:
 - State management for GLT layers and window caches for Anchor Attention
 """
 
+import functools
 import math
 import torch
 import torch.nn as nn
@@ -713,8 +714,12 @@ class ContinuumModel(nn.Module):
                     or (x.is_cuda and self.training and _est_bytes > 11.0e9)
                 )
                 if _use_ckpt:
+                    # NOTE: use functools.partial, NOT a lambda over `block` —
+                    # checkpoint re-runs this in backward, AFTER the loop
+                    # finished; a lambda would late-bind the loop variable to
+                    # the LAST block (an anchor) and crash with AttributeError.
                     o, final_state = torch.utils.checkpoint.checkpoint(
-                        lambda xn: self._glt_scan_branch(block, xn),
+                        functools.partial(self._glt_scan_branch, block),
                         x_norm,
                         use_reentrant=False,
                     )
