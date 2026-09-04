@@ -37,7 +37,7 @@ jobs:
       - name: Syntax check all Python files
         run: |
           python -m compileall -q continuum
-          echo "✅ All Python files compile successfully!"
+          echo "All Python files compile successfully!"
 
       - name: Run full unit test suite (failures fail the build)
         working-directory: continuum
@@ -48,42 +48,61 @@ jobs:
           rc=$?
           if [ $rc -ne 0 ]; then
             # Surface failures as GitHub annotations (publicly readable).
-            # GitHub caps annotations at 10, so emit ONLY the FAILED summary
-            # lines pytest prints at the end (test name + reason).
-            grep '^FAILED' /tmp/pytest_out.txt | sed 's/^/::error::/' | head -10
-            # Then re-run the first failing test with a short traceback and
-            # emit its TOP frames (outermost = our test/model code first).
-            failed=$(grep '^FAILED' /tmp/pytest_out.txt | awk '{print $2}' | head -1)
-            if [ -n "$failed" ]; then
-              python -m pytest "$failed" -x --tb=short --no-header -q 2>&1 \
-                | head -14 | sed 's/^/::error::/'
-              # GLT scan cross-check: einsum vs chunked vs sequential (three
-              # independent implementations) — tells us WHICH one diverges.
-              cd ..
-              python - <<'DBG' 2>&1 | head -20 | sed 's/^/::error::/'
-import torch
-from continuum.training.parallel_scan import (
-    glt_sequential_forward, _glt_scan_einsum_with_state,
-    _compute_chunked_outer_product_and_scan,
-)
-torch.manual_seed(0)
-B, L, D = 2, 33, 24
-r = torch.sigmoid(torch.randn(B, L, D)); Wo = torch.randn(D, D)
-k = torch.randn(B, L, D); v = torch.randn(B, L, D); q = torch.randn(B, L, D)
-gamma = torch.sigmoid(torch.randn(B, L, D)); iota = torch.sigmoid(torch.randn(B, L, D))
-h_e, fs_e = _glt_scan_einsum_with_state(k, v, q, gamma, iota)
-h_c, fs_c = _compute_chunked_outer_product_and_scan(k, v, q, gamma, iota, chunk_size=16)
-o_s = glt_sequential_forward(k, v, q, gamma, iota, r, Wo)
-o_c = r * h_c @ Wo.T
-o_e = r * h_e @ Wo.T
-print('torch', torch.__version__)
-print('h einsum vs chunked :', (h_e - h_c).abs().max().item())
-print('fs einsum vs chunked:', (fs_e - fs_c).abs().max().item())
-print('o einsum vs sequential:', (o_e - o_s).abs().max().item())
-print('o chunked vs sequential:', (o_c - o_s).abs().max().item())
-DBG
-              cd continuum
-            fi
+            # GitHub caps annotations at 10 per check run, so emit only the
+            # first FAILED summary line + a tight diagnostic block.
+            grep '^FAILED' /tmp/pytest_out.txt | sed 's/^/::error::/' | head -1
+            echo "::group::GLT scan 3-way cross-check"
+            # Three independent implementations + an unambiguous per-(t) loop
+            # reference derived straight from the recurrence
+            # S_t = gamma_t*S_{t-1} + iota_t*(k_t x v_t). Whichever matches the
+            # loop reference is "right"; the one that disagrees is at fault.
+            python - <<'PYEOF' 2>&1 | sed 's/^/::error::/' | head -12
+          import torch
+          from continuum.training.parallel_scan import (
+              glt_sequential_forward, _glt_scan_einsum_with_state,
+              _compute_chunked_outer_product_and_scan,
+          )
+          torch.manual_seed(0)
+          B, L, D = 2, 33, 24
+          r = torch.sigmoid(torch.randn(B, L, D)); Wo = torch.randn(D, D)
+          k = torch.randn(B, L, D); v = torch.randn(B, L, D); q = torch.randn(B, L, D)
+          gamma = torch.sigmoid(torch.randn(B, L, D)); iota = torch.sigmoid(torch.randn(B, L, D))
+          h_e, fs_e = _glt_scan_einsum_with_state(k, v, q, gamma, iota)
+          h_c, fs_c = _compute_chunked_outer_product_and_scan(k, v, q, gamma, iota, chunk_size=16)
+          with torch.no_grad():
+              hs = []
+              for t in range(L):
+                  acc = torch.zeros(B, D)
+                  for i in range(t + 1):
+                      dec = torch.ones(B, D)
+                      for m in range(i + 1, t + 1):
+                          dec = dec * gamma[:, m, :]
+                      acc = acc + dec * iota[:, i, :] * k[:, i, :] * (v[:, i, :] * q[:, t, :]).sum(-1)
+                  hs.append(acc)
+              h_ref = torch.stack(hs, dim=1)
+          o_s = glt_sequential_forward(k, v, q, gamma, iota, r, Wo)
+          o_e = r * h_e @ Wo.T
+          o_c = r * h_c @ Wo.T
+          o_r = r * h_ref @ Wo.T
+          print('torch', torch.__version__)
+          print('o einsum  vs sequential:', (o_e - o_s).abs().max().item())
+          print('o chunked vs sequential:', (o_c - o_s).abs().max().item())
+          print('o loopref vs sequential:', (o_r - o_s).abs().max().item())
+          print('h einsum  vs loopref:', (h_e - h_ref).abs().max().item())
+          print('h chunked vs loopref:', (h_c - h_ref).abs().max().item())
+          d = (o_e - o_s).abs()
+          if d.max().item() > 1e-3:
+              idx = d.argmax().item()
+              b = idx // (L * D); rem = idx % (L * D); t = rem // D; dd = rem % D
+              print('first big einsum-vs-seq diff at b,t,d =', (b, t, dd),
+                    'vals', o_e[b, t, dd].item(), o_s[b, t, dd].item())
+              d2 = (h_e - h_ref).abs()
+              idx2 = d2.argmax().item()
+              b2 = idx2 // (L * D); rem2 = idx2 % (L * D); t2 = rem2 // D; d2i = rem2 % D
+              print('first big einsum-vs-loopref diff at b,t,d =', (b2, t2, d2i),
+                    'vals', h_e[b2, t2, d2i].item(), h_ref[b2, t2, d2i].item())
+          PYEOF
+            echo "::endgroup::"
             exit $rc
           fi
 
@@ -97,7 +116,7 @@ DBG
           inp = torch.randint(0, 100, (1, 8))
           out = model.forward(inp)
           assert out['logits'].shape == (1, 8, 8000), f'Shape mismatch: {out[\"logits\"].shape}'
-          print(f'✅ Model test PASSED: {model.num_params:,} params')
+          print(f'Model test PASSED: {model.num_params:,} params')
           "
 
   cpp:
@@ -111,4 +130,4 @@ DBG
           cd continuum.cpp
           make -j2
           ./build/continuum --help >/dev/null
-          echo "✅ C++ build PASSED"
+          echo "C++ build PASSED"
