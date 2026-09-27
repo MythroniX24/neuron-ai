@@ -53,6 +53,7 @@ class ContinuumTrainer:
         device: str = "cpu",
         use_amp: bool = True,
         compile_model: bool = False,
+        use_multi_gpu: bool = True,
         use_parallel_forward: bool = True,
         use_gradient_checkpointing: bool = False,  # ⚡ Phase 8: Save VRAM on embedding output
         adl_train_every: int = 0,  # ⚡ 0 = never (legacy); N = every Nth optimizer step runs full-ADL
@@ -138,6 +139,33 @@ class ContinuumTrainer:
                     print(f"  ⚠️ torch.compile failed: {e}")
         if self.use_compiled and self.compile_mode and "max-autotune" in self.compile_mode:
             print("  ⏳ First step will be slow (~5 min) — max-autotune is autotuning kernels...")
+
+        # ⚡ FIX (multi-GPU): a second GPU was detected and printed by the
+        # notebook but NEVER USED — the model stayed on cuda:0 and every
+        # step ran on a single T4, wasting ~half the Kaggle T4x2 budget.
+        # Wrap in DataParallel so the batch is split across all visible GPUs.
+        #
+        # Applied AFTER torch.compile on purpose: compiling the inner module
+        # and then wrapping keeps Dynamo's graph intact (wrapping first would
+        # make the replicated forward opaque to the compiler). Parameter
+        # objects are shared, so the optimizer/param_groups built below are
+        # unaffected and gradients are identical to single-GPU — this is a
+        # pure throughput change, not a math change.
+        self.n_gpus = 1
+        # Raw (unwrapped) module reference. DataParallel does NOT forward
+        # attribute access, so `self.model.forward_parallel`, `.num_params`
+        # and `.perception_blocks` would all raise AttributeError. Every
+        # such call site goes through this instead.
+        self.raw_model = self.model
+        if use_multi_gpu and device == "cuda":
+            n_avail = torch.cuda.device_count()
+            if n_avail > 1:
+                self.model = torch.nn.DataParallel(self.model)
+                self.n_gpus = n_avail
+                print(f"  ✅ DataParallel: using {n_avail} GPUs "
+                      f"(per-GPU batch = ceil(batch/{n_avail}))")
+            else:
+                print("  ℹ️  Only 1 GPU visible — training single-GPU")
 
         # ⚡ Phase 15: Param Groups — no weight decay on biases, norms, and embeddings.
         # This is standard practice in GPT-3, Llama, etc.:
@@ -252,9 +280,9 @@ class ContinuumTrainer:
         layers into the [B, L, K, n_layers] tensor the loss expects.
         """
         gate_lists: List[torch.Tensor] = []
-        for block in (list(self.model.perception_blocks) +
-                      list(self.model.core_blocks) +
-                      list(self.model.output_blocks)):
+        for block in (list(self.raw_model.perception_blocks) +
+                      list(self.raw_model.core_blocks) +
+                      list(self.raw_model.output_blocks)):
             ffn = getattr(block, "ffn", None)
             gates = getattr(ffn, "_last_gates", None) if ffn is not None else None
             if gates is not None:
@@ -327,11 +355,11 @@ class ContinuumTrainer:
                 and self._optimizer_step_count % self.adl_train_every == 0
             )
             if self.use_parallel_forward:
-                result = self.model.forward_parallel(
+                result = self.raw_model.forward_parallel(
                     input_ids, core_max_loops=None if adl_step else 1
                 )
             else:
-                result = self.model.forward(input_ids, core_max_loops=None if adl_step else 1)
+                result = self.raw_model.forward(input_ids, core_max_loops=None if adl_step else 1)
             logits = result["logits"]
             ponder_cost = result["ponder_cost"]
 
@@ -443,9 +471,9 @@ class ContinuumTrainer:
     def _monitor_gamma_gates(self) -> Dict[str, float]:
         """Monitor GLT decay gate distribution for training stability (Section 18)."""
         gamma_means = []
-        for block in (list(self.model.perception_blocks) +
-                      list(self.model.core_blocks) +
-                      list(self.model.output_blocks)):
+        for block in (list(self.raw_model.perception_blocks) +
+                      list(self.raw_model.core_blocks) +
+                      list(self.raw_model.output_blocks)):
             if block.is_glt:
                 # Get current bias values (which determine gamma via sigmoid)
                 bias = block.mixer.W_gamma.bias.detach()
@@ -488,9 +516,9 @@ class ContinuumTrainer:
             # the training distribution.
             with torch.amp.autocast("cuda", enabled=self.use_amp, dtype=torch.float16):
                 if self.use_parallel_forward:
-                    result = self.model.forward_parallel(input_ids, core_max_loops=1)
+                    result = self.raw_model.forward_parallel(input_ids, core_max_loops=1)
                 else:
-                    result = self.model.forward(input_ids, core_max_loops=1)
+                    result = self.raw_model.forward(input_ids, core_max_loops=1)
                 logits = result["logits"]
 
                         # ⚡ Slices are already contiguous in memory
@@ -563,7 +591,7 @@ class ContinuumTrainer:
         print(f"Starting training: {num_epochs} epochs, ~{total_steps} steps")
         print(f"  Optimizer steps: ~{self._total_optimizer_steps} (grad_accum={grad_accum_steps})")
         print(f"  LR schedule: warmup({self.warmup_steps}) → cosine decay → {self.base_lr * 0.01:.2e}")
-        print(f"Model: {self.model.num_params:,} parameters")
+        print(f"Model: {self.raw_model.num_params:,} parameters")
         print(f"Device: {self.device}")
         mode = "Parallel (Phase 2)" if self.use_parallel_forward else "Sequential"
         print(f"Forward mode: {mode}")

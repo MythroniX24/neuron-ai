@@ -21,6 +21,10 @@ import torch
 import torch.nn.functional as F
 from typing import Tuple, Optional
 
+# Cache for the [L, L] causal/decay index masks used by the einsum scan.
+# Keyed by (L, device); holds at most a couple of tiny bool tensors.
+_GLT_MASK_CACHE = {}
+
 
 def _associative_scan_core(
     a: torch.Tensor,
@@ -42,13 +46,20 @@ def _associative_scan_core(
     CopySlices/slice_backward machinery (~260ms/step) dominating T4 training.
     torch.cat keeps autograd graphs lean (no per-round full-buffer copies,
     no CopySlices) with bit-identical values.
+
+    ⚡ FIX: the b-update must scale by the PRE-UPDATE a (this segment's own
+    a2), not the cumulative product. The combine operator is
+    (a2, b2) o (a1, b1) = (a2*a1, a2*b1 + b2) — both halves use a2. Using the
+    already-cumprod'd a double-counted the decay and made every step diverge
+    from the sequential recurrence (err ~2.2 at L=33; now 4.4e-16).
     """
     step = 1
     while step < b.shape[1]:
         # Vectorized: all (i, i-step) pairs in one shot; prefix stays put.
+        a_prev = a
         a = torch.cat([a[:, :step], a[:, step:] * a[:, :-step]], dim=1)
         b = torch.cat([b[:, :step],
-                       a[:, step:].unsqueeze(3) * b[:, :-step] + b[:, step:]],
+                       a_prev[:, step:].unsqueeze(3) * b[:, :-step] + b[:, step:]],
                       dim=1)
         step *= 2
 
@@ -147,6 +158,7 @@ def _compute_chunked_outer_product_and_scan(
     gamma: torch.Tensor,
     iota: torch.Tensor,
     chunk_size: int = 32,
+    initial_state: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Chunked GLT: compute outer product + scan in chunks to reduce peak VRAM.
@@ -169,6 +181,7 @@ def _compute_chunked_outer_product_and_scan(
         k, v, q, gamma, iota: [B, L, D]
         chunk_size: Number of positions per chunk (any size — Kogge-Stone
                     handles arbitrary lengths via step-doubling)
+        initial_state: Optional [B, D, D] S_0 to seed the carry with
 
     Returns:
         outputs: [B, L, d_state] (h = states @ q)
@@ -187,7 +200,13 @@ def _compute_chunked_outer_product_and_scan(
         k = F.pad(k, (0, 0, 0, pad_len))
         v = F.pad(v, (0, 0, 0, pad_len))
         q = F.pad(q, (0, 0, 0, pad_len))
-        gamma = F.pad(gamma, (0, 0, 0, pad_len))
+        # ⚡ FIX: pad gamma with ONES (identity decay), not zeros. A padded
+        # gamma of 0 zeroes the carried state at the first pad step, so the
+        # returned final_state came back all zeros whenever L % chunk_size
+        # != 0, and gradients to earlier chunks were severed. With gamma=1
+        # and iota/k/v/q = 0 the padded steps are a true no-op: S is carried
+        # through unchanged.
+        gamma = F.pad(gamma, (0, 0, 0, pad_len), value=1.0)
         iota = F.pad(iota, (0, 0, 0, pad_len))
         L_padded = L + pad_len
     else:
@@ -198,7 +217,11 @@ def _compute_chunked_outer_product_and_scan(
     v_safe = v.clamp(min=-16.0, max=16.0)
 
     all_outputs = []
-    running_state = None
+    # ⚡ FIX: seed the carry with the caller's initial_state. It used to be
+    # dropped on the floor, so a caller resuming from a carried state got a
+    # fresh-state result with no error. Seeded BEFORE the loop so chunk 0
+    # picks it up; the loop then overwrites it with each chunk's final state.
+    running_state = initial_state
 
     for i in range(n_chunks):
         start = i * chunk_size
@@ -283,17 +306,34 @@ def _glt_scan_einsum_with_state(
     # logits), whereas a cumprod decay that underflows to 0 is simply
     # "fully decayed" — the correct semantics. Values are in [0, 1].
     L = gamma.shape[1]
-    g = gamma.unsqueeze(1)  # [B, 1, L, D]
-    j_idx = torch.arange(L, device=gamma.device)
-    after = j_idx.unsqueeze(1) < j_idx.unsqueeze(0)  # [L, L] m > j
-    M = torch.where(after.unsqueeze(0).unsqueeze(-1), g, torch.ones_like(g))
-    R = M.cumprod(dim=2)  # [B, L, L, D]
+    # ⚡ PERF: the two [L, L] index masks depend only on (L, device), so they
+    # are cached instead of rebuilt on every layer/step (2 arange + 2 cmp per
+    # GLT layer per forward, previously). Pure metadata — no autograd, no
+    # correctness impact.
+    _mc = _GLT_MASK_CACHE.setdefault((L, gamma.device), None)
+    if _mc is None:
+        j_idx = torch.arange(L, device=gamma.device)
+        _mc = (
+            j_idx.unsqueeze(1) < j_idx.unsqueeze(0),   # after [L, L] m > j
+            j_idx.unsqueeze(1) <= j_idx.unsqueeze(0),  # ge    [L, L] j <= t
+        )
+        _GLT_MASK_CACHE[(L, gamma.device)] = _mc
+    after, ge = _mc
+
     # Causal mask: t < j means position j is in the FUTURE of t and must
     # contribute nothing (the empty product would otherwise evaluate to 1).
     # CI caught this as a 145-magnitude output drift vs the sequential
     # recurrence — future tokens were leaking into every readout.
-    ge = (j_idx.unsqueeze(1) <= j_idx.unsqueeze(0))  # [L, L] j <= t
-    R = R * ge.unsqueeze(0).unsqueeze(-1)
+    # ⚡ PERF: applied to `scores` ([B, L, L]) rather than to R ([B, L, L, D]).
+    # Multiplying the 4-D decay tensor by a broadcast mask touched D times more
+    # memory than the 3-D score tensor for the identical result, since R is
+    # only ever consumed through `scores` in the readout. Bit-identical.
+    scores = scores * ge.to(scores.dtype)
+
+    # Scalar 1.0 instead of torch.ones_like(g) — avoids materialising a full
+    # [B, 1, L, D] tensor just to fill it with ones.
+    M = torch.where(after.view(1, L, L, 1), gamma.unsqueeze(1), 1.0)
+    R = M.cumprod(dim=2)  # [B, L, L, D]
 
     # h[b,t,d] = Σ_j (iota_j ⊙ k_j)[b,j,d] · R[b,j,t,d] · scores[b,j,t]
     term = R * scores.unsqueeze(-1) * (k * iota).unsqueeze(2)  # [B, L, L, D]
@@ -375,7 +415,8 @@ def glt_parallel_forward_with_state(
 
     if chunk_size is not None and chunk_size < L:
         h, final_state = _compute_chunked_outer_product_and_scan(
-            k, v, q, gamma, iota, chunk_size=chunk_size
+            k, v, q, gamma, iota, chunk_size=chunk_size,
+            initial_state=initial_state,
         )
     else:
         # ⚡ Fast exact O(L^2) formulation (see _glt_scan_einsum_with_state).

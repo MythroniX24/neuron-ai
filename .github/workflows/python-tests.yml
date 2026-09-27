@@ -79,7 +79,7 @@ jobs:
                       dec = torch.ones(B, D)
                       for m in range(i + 1, t + 1):
                           dec = dec * gamma[:, m, :]
-                      acc = acc + dec * iota[:, i, :] * k[:, i, :] * (v[:, i, :] * q[:, t, :]).sum(-1)
+                      acc = acc + dec * iota[:, i, :] * k[:, i, :] * (v[:, i, :] * q[:, t, :]).sum(-1, keepdim=True)
                   hs.append(acc)
               h_ref = torch.stack(hs, dim=1)
           o_s = glt_sequential_forward(k, v, q, gamma, iota, r, Wo)

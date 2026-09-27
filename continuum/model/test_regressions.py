@@ -218,7 +218,12 @@ def test_parallel_scan_matches_sequential_reference():
 
     p_p = fresh(base)
     o_p, fs_p = glt_parallel_forward_with_state(*p_p, r, Wo)
-    (o_p.sum() + fs_p.sum()).backward()
+    # ⚡ FIX: backprop o ONLY here. This used to backprop (o + fs) while the
+    # sequential reference below backprops o alone — two different losses, so
+    # the gradient comparison was meaningless (it failed on a correct
+    # implementation). fs gradients get their own dedicated check against the
+    # manual recurrence further down.
+    o_p.sum().backward()
     g_p = [None if pp.grad is None else pp.grad.clone() for pp in p_p]
 
     p_s = fresh(base)
@@ -249,6 +254,33 @@ def test_parallel_scan_matches_sequential_reference():
     assert _t.allclose(fs_p, S, atol=1e-5, rtol=1e-4), (
         f"einsum final_state drift: max diff {(fs_p - S).abs().max().item():.6f}"
     )
+
+    # Final-state GRADIENT parity vs the manual recurrence. The sequential
+    # helper returns only `o`, so fs needs its own differentiable reference.
+    p_fs = fresh(base)
+    _, fs_only = glt_parallel_forward_with_state(*p_fs, r, Wo)
+    fs_only.sum().backward()
+    g_fs = [None if pp.grad is None else pp.grad.clone() for pp in p_fs]
+
+    kb, vb, qb, gb, ib = [t.detach().clone().requires_grad_(True) for t in base]
+    S2 = _t.zeros(B, D, D)
+    for t in range(L):
+        S2 = (gb[:, t, :].unsqueeze(2) * S2
+              + ib[:, t, :].unsqueeze(2)
+              * (kb[:, t, :].unsqueeze(2) @ vb[:, t, :].unsqueeze(1)))
+    S2.sum().backward()
+    # `q` is deliberately absent: the final state S_L depends on k, v, gamma
+    # and iota only (q enters solely through the per-position readout h), so
+    # both sides must leave q.grad as None.
+    for name, gc, gr in zip(("k", "v", "gamma", "iota"),
+                            (g_fs[0], g_fs[1], g_fs[3], g_fs[4]),
+                            (kb.grad, vb.grad, gb.grad, ib.grad)):
+        assert gc is not None and gr is not None, f"missing fs grad on {name}"
+        assert _t.allclose(gc, gr, atol=1e-4, rtol=1e-3), (
+            f"einsum final_state grad drift on {name}: "
+            f"max diff {(gc - gr).abs().max().item():.6f}"
+        )
+    assert g_fs[2] is None, "q should receive no gradient from final_state alone"
 
     # Initial-state parity vs the (independent, fp32) chunked path — both
     # consume the SAME tensors (no backward on this section).
